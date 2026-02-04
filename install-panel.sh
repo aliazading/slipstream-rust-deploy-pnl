@@ -25,7 +25,7 @@ SYSTEMD_DIR="/etc/systemd/system"
 
 GITHUB_USER="${GITHUB_USER:-aliazading}"
 GITHUB_REPO="${GITHUB_REPO:-slipstream-rust-deploy-pnl}"
-GITHUB_BRANCH="${GITHUB_BRANCH:-master}"
+GITHUB_BRANCH="${GITHUB_BRANCH:-fix/panel-installation}"
 DEPLOY_REPO_URL="${DEPLOY_REPO_URL:-https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git}"
 
 VPN_GROUP="slipstream-users"

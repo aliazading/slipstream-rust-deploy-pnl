@@ -21,7 +21,7 @@ NC='\033[0m' # No Color
 # Global variables
 GITHUB_USER="${GITHUB_USER:-aliazading}"
 GITHUB_REPO="${GITHUB_REPO:-slipstream-rust-deploy-pnl}"
-GITHUB_BRANCH="${GITHUB_BRANCH:-master}"
+GITHUB_BRANCH="${GITHUB_BRANCH:-fix/panel-installation}"
 BASE_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}"
 
 SCRIPT_URL="${SCRIPT_URL:-${BASE_URL}/slipstream-rust-deploy.sh}"
