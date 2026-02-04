@@ -318,10 +318,11 @@ show_menu() {
     echo "4) View service logs"
     echo "5) Show configuration info"
     echo "6) Show management panel info"
-    echo "7) Uninstall slipstream-rust"
+    echo "7) Install/Update management panel only"
+    echo "8) Uninstall slipstream-rust"
     echo "0) Exit"
     echo ""
-    print_question "Please select an option (0-7): "
+    print_question "Please select an option (0-8): "
 }
 
 # Function to handle menu selection
@@ -358,6 +359,10 @@ handle_menu() {
                 show_panel_info
                 ;;
             7)
+                setup_panel
+                show_panel_info
+                ;;
+            8)
                 if uninstall_slipstream; then
                     exit 0
                 fi
@@ -367,7 +372,7 @@ handle_menu() {
                 exit 0
                 ;;
             *)
-                print_error "Invalid choice. Please enter 0-7."
+                print_error "Invalid choice. Please enter 0-8."
                 ;;
         esac
 
@@ -1918,7 +1923,7 @@ setup_panel() {
         print_status "Downloading panel files from repository: $DEPLOY_REPO_URL"
         local temp_deploy_dir="/tmp/slipstream-deploy-repo"
         rm -rf "$temp_deploy_dir"
-        if git clone "$DEPLOY_REPO_URL" "$temp_deploy_dir"; then
+        if git clone --depth 1 "$DEPLOY_REPO_URL" "$temp_deploy_dir"; then
             mkdir -p "$BUILD_DIR"
             cp -r "$temp_deploy_dir/panel" "$BUILD_DIR/"
             rm -rf "$temp_deploy_dir"

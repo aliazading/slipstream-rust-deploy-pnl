@@ -348,6 +348,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/aliazading/slipstream-rust-dep
 # The script will detect and install updates automatically
 ```
 
+**Note for Menu Options:** If you don't see the "Management Panel" options in the menu after updating, run the one-liner above again to force the script to overwrite with the latest version from the fork.
+
 ### Updating the Binary
 
 To update to the latest version:
@@ -498,6 +500,12 @@ When you install slipstream-rust in **SOCKS mode** with authentication enabled, 
 - 👥 **User Management**: Add and delete VPN users easily.
 - 🌓 **Dark Mode**: Modern UI with Persian language support.
 - ⚡ **Real-time**: Changes take effect immediately.
+
+### Installation (Standalone)
+If you already have a Slipstream-Rust server running and just want to add the panel, run:
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/aliazading/slipstream-rust-deploy-pnl/master/install-panel.sh)
+```
 
 ### How to Access
 After a successful installation, the script will display your unique Panel URL, Admin Username, and Admin Password.
