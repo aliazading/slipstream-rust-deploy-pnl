@@ -21,7 +21,7 @@ NC='\033[0m' # No Color
 # Global variables
 GITHUB_USER="${GITHUB_USER:-aliazading}"
 GITHUB_REPO="${GITHUB_REPO:-slipstream-rust-deploy-pnl}"
-GITHUB_BRANCH="${GITHUB_BRANCH:-fix/panel-installation}"
+GITHUB_BRANCH="${GITHUB_BRANCH:-master}"
 BASE_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}"
 
 SCRIPT_URL="${SCRIPT_URL:-${BASE_URL}/slipstream-rust-deploy.sh}"
@@ -471,7 +471,7 @@ show_panel_info() {
         return 1
     fi
 
-    if [[ -z "${PANEL_PORT:-}" ]]; then
+    if [[ -z "${PANEL_PORT:-}" || ! -f "/etc/systemd/system/slipstream-panel.service" ]]; then
         print_warning "Management panel is not configured or not available for the current mode."
         return 0
     fi
@@ -549,7 +549,7 @@ show_configuration_info() {
         echo -e "  Start:   ${YELLOW}systemctl start danted${NC}"
         echo -e "  Logs:    ${YELLOW}journalctl -u danted -f${NC}"
 
-        if [[ -n "${PANEL_PORT:-}" ]]; then
+        if [[ -n "${PANEL_PORT:-}" && -f "/etc/systemd/system/slipstream-panel.service" ]]; then
             local public_ip
             public_ip=$(curl -s https://ipinfo.io/ip || echo "YOUR_SERVER_IP")
             echo ""
@@ -1887,6 +1887,11 @@ EOF
 
 # Function to setup management panel
 setup_panel() {
+    # Check if panel is already configured (prevents duplicate info box if called multiple times)
+    if [[ -n "${PANEL_PORT:-}" && -f "/etc/systemd/system/slipstream-panel.service" ]]; then
+        return 0
+    fi
+
     if [[ "$TUNNEL_MODE" != "socks" || "${SOCKS_AUTH_ENABLED:-no}" != "yes" ]]; then
         return 0
     fi
@@ -1934,20 +1939,45 @@ setup_panel() {
         print_status "Downloading panel files from repository: $DEPLOY_REPO_URL"
         local temp_deploy_dir="/tmp/slipstream-deploy-repo"
         rm -rf "$temp_deploy_dir"
-        # Try to clone with specified branch
-        if git clone --depth 1 -b "$GITHUB_BRANCH" "$DEPLOY_REPO_URL" "$temp_deploy_dir" 2>/dev/null || \
-           git clone --depth 1 "$DEPLOY_REPO_URL" "$temp_deploy_dir"; then
-            mkdir -p "$BUILD_DIR"
-            if [[ -d "$temp_deploy_dir/panel" ]]; then
-                cp -r "$temp_deploy_dir/panel" "$BUILD_DIR/"
-                rm -rf "$temp_deploy_dir"
-                print_status "Successfully downloaded panel files."
-            else
-                print_error "Panel directory not found in the cloned repository."
-                rm -rf "$temp_deploy_dir"
+
+        # Try to clone with specified branch, fallback to feature branch if needed
+        local clone_success=false
+        local branches_to_try=("fix/panel-installation" "feature/user-management-panel-4891438396886854186" "$GITHUB_BRANCH" "master")
+
+        for branch in "${branches_to_try[@]}"; do
+            print_status "Trying to download panel files from branch: $branch"
+            rm -rf "$temp_deploy_dir"
+            if git clone --depth 1 -b "$branch" "$DEPLOY_REPO_URL" "$temp_deploy_dir" 2>/dev/null; then
+                if [[ -d "$temp_deploy_dir/panel" ]]; then
+                    mkdir -p "$BUILD_DIR"
+                    cp -r "$temp_deploy_dir/panel" "$BUILD_DIR/"
+                    rm -rf "$temp_deploy_dir"
+                    print_status "Successfully downloaded panel files from branch $branch."
+                    clone_success=true
+                    break
+                else
+                    print_warning "Panel directory not found in branch $branch."
+                fi
             fi
-        else
-            print_error "Failed to download panel files from repository."
+        done
+
+        if [[ "$clone_success" = false ]]; then
+            # Last ditch effort: default clone
+            print_status "Trying default branch clone..."
+            rm -rf "$temp_deploy_dir"
+            if git clone --depth 1 "$DEPLOY_REPO_URL" "$temp_deploy_dir" 2>/dev/null; then
+                if [[ -d "$temp_deploy_dir/panel" ]]; then
+                    mkdir -p "$BUILD_DIR"
+                    cp -r "$temp_deploy_dir/panel" "$BUILD_DIR/"
+                    rm -rf "$temp_deploy_dir"
+                    print_status "Successfully downloaded panel files from default branch."
+                    clone_success=true
+                fi
+            fi
+        fi
+
+        if [[ "$clone_success" = false ]]; then
+            print_error "Failed to download panel files from any known branch."
         fi
     fi
 
@@ -2151,7 +2181,7 @@ print_success_box() {
         echo -e "  ${text_color}Start:   systemctl start danted${reset}"
         echo -e "  ${text_color}Logs:    journalctl -u danted -f${reset}"
 
-        if [[ -n "${PANEL_PORT:-}" ]]; then
+        if [[ -n "${PANEL_PORT:-}" && -f "/etc/systemd/system/slipstream-panel.service" ]]; then
             echo ""
             echo -e "${header_color}Management Panel Information:${reset}"
             echo -e "  ${text_color}Panel URL: ${key_color}http://${public_ip}:${PANEL_PORT}/${PANEL_SECRET}/panel/login${reset}"

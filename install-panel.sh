@@ -25,7 +25,7 @@ SYSTEMD_DIR="/etc/systemd/system"
 
 GITHUB_USER="${GITHUB_USER:-aliazading}"
 GITHUB_REPO="${GITHUB_REPO:-slipstream-rust-deploy-pnl}"
-GITHUB_BRANCH="${GITHUB_BRANCH:-fix/panel-installation}"
+GITHUB_BRANCH="${GITHUB_BRANCH:-master}"
 DEPLOY_REPO_URL="${DEPLOY_REPO_URL:-https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git}"
 
 VPN_GROUP="slipstream-users"
@@ -84,19 +84,43 @@ if [[ -d "./panel" ]]; then
 else
     temp_dir="/tmp/slipstream-panel-install"
     rm -rf "$temp_dir"
-    if ! git clone --depth 1 -b "$GITHUB_BRANCH" "$DEPLOY_REPO_URL" "$temp_dir" 2>/dev/null && \
-       ! git clone --depth 1 "$DEPLOY_REPO_URL" "$temp_dir"; then
-        print_error "Failed to clone repository from $DEPLOY_REPO_URL"
-        exit 1
+
+    local clone_success=false
+    local branches_to_try=("fix/panel-installation" "feature/user-management-panel-4891438396886854186" "$GITHUB_BRANCH" "master")
+
+    for branch in "${branches_to_try[@]}"; do
+        print_status "Trying branch: $branch"
+        rm -rf "$temp_dir"
+        if git clone --depth 1 -b "$branch" "$DEPLOY_REPO_URL" "$temp_dir" 2>/dev/null; then
+            if [[ -d "$temp_dir/panel" ]]; then
+                mkdir -p "$PANEL_DIR"
+                cp -r "$temp_dir/panel"/* "$PANEL_DIR/"
+                rm -rf "$temp_dir"
+                print_status "Successfully downloaded panel files from branch $branch."
+                clone_success=true
+                break
+            else
+                print_warning "Panel directory not found in branch $branch."
+            fi
+        fi
+    done
+
+    if [[ "$clone_success" = false ]]; then
+        print_status "Trying default branch..."
+        rm -rf "$temp_dir"
+        if git clone --depth 1 "$DEPLOY_REPO_URL" "$temp_dir" 2>/dev/null; then
+            if [[ -d "$temp_dir/panel" ]]; then
+                mkdir -p "$PANEL_DIR"
+                cp -r "$temp_dir/panel"/* "$PANEL_DIR/"
+                rm -rf "$temp_dir"
+                print_status "Successfully downloaded panel files from default branch."
+                clone_success=true
+            fi
+        fi
     fi
 
-    if [[ -d "$temp_dir/panel" ]]; then
-        mkdir -p "$PANEL_DIR"
-        cp -r "$temp_dir/panel"/* "$PANEL_DIR/"
-        rm -rf "$temp_dir"
-    else
-        print_error "Panel directory not found in the cloned repository!"
-        rm -rf "$temp_dir"
+    if [[ "$clone_success" = false ]]; then
+        print_error "Failed to download panel files from any known branch!"
         exit 1
     fi
 fi
