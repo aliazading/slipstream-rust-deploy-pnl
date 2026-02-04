@@ -85,8 +85,8 @@ else
     temp_dir="/tmp/slipstream-panel-install"
     rm -rf "$temp_dir"
 
-    local clone_success=false
-    local branches_to_try=("fix/panel-installation" "feature/user-management-panel-4891438396886854186" "$GITHUB_BRANCH" "master")
+    clone_success=false
+    branches_to_try=("fix/panel-installation" "feature/user-management-panel-4891438396886854186" "$GITHUB_BRANCH" "master")
 
     for branch in "${branches_to_try[@]}"; do
         print_status "Trying branch: $branch"
