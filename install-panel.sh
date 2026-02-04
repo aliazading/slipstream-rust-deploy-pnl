@@ -22,7 +22,12 @@ CONFIG_DIR="/etc/slipstream-rust"
 CONFIG_FILE="${CONFIG_DIR}/slipstream-rust-server.conf"
 PANEL_DIR="/usr/local/share/slipstream-rust-panel"
 SYSTEMD_DIR="/etc/systemd/system"
-DEPLOY_REPO_URL="https://github.com/aliazading/slipstream-rust-deploy-pnl.git"
+
+GITHUB_USER="${GITHUB_USER:-aliazading}"
+GITHUB_REPO="${GITHUB_REPO:-slipstream-rust-deploy-pnl}"
+GITHUB_BRANCH="${GITHUB_BRANCH:-master}"
+DEPLOY_REPO_URL="${DEPLOY_REPO_URL:-https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git}"
+
 VPN_GROUP="slipstream-users"
 
 print_status() { echo -e "${GREEN}[INFO]${NC} $1"; }
@@ -72,16 +77,29 @@ fi
 
 # 5. Download panel files
 print_status "Downloading panel files..."
-temp_dir="/tmp/slipstream-panel-install"
-rm -rf "$temp_dir"
-if ! git clone "$DEPLOY_REPO_URL" "$temp_dir"; then
-    print_error "Failed to clone repository from $DEPLOY_REPO_URL"
-    exit 1
-fi
+if [[ -d "./panel" ]]; then
+    print_status "Using panel files from current directory."
+    mkdir -p "$PANEL_DIR"
+    cp -r "./panel"/* "$PANEL_DIR/"
+else
+    temp_dir="/tmp/slipstream-panel-install"
+    rm -rf "$temp_dir"
+    if ! git clone --depth 1 -b "$GITHUB_BRANCH" "$DEPLOY_REPO_URL" "$temp_dir" 2>/dev/null && \
+       ! git clone --depth 1 "$DEPLOY_REPO_URL" "$temp_dir"; then
+        print_error "Failed to clone repository from $DEPLOY_REPO_URL"
+        exit 1
+    fi
 
-mkdir -p "$PANEL_DIR"
-cp -r "$temp_dir/panel"/* "$PANEL_DIR/"
-rm -rf "$temp_dir"
+    if [[ -d "$temp_dir/panel" ]]; then
+        mkdir -p "$PANEL_DIR"
+        cp -r "$temp_dir/panel"/* "$PANEL_DIR/"
+        rm -rf "$temp_dir"
+    else
+        print_error "Panel directory not found in the cloned repository!"
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+fi
 
 # 6. Setup Virtual Environment
 print_status "Setting up Python virtual environment..."
