@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# slipstream-rust Server Setup Script
+# slipstream-rust Server Setup Script (v1.1 - with Panel)
 # Supports Fedora, Rocky, CentOS, Debian, Ubuntu
 
 set -e
@@ -28,6 +28,7 @@ CONFIG_FILE="${CONFIG_DIR}/slipstream-rust-server.conf"
 SCRIPT_INSTALL_PATH="/usr/local/bin/slipstream-rust-deploy"
 BUILD_DIR="/opt/slipstream-rust"
 REPO_URL="https://github.com/Mygod/slipstream-rust.git"
+DEPLOY_REPO_URL="https://github.com/aliazading/slipstream-rust-deploy-pnl.git"
 SLIPSTREAM_PORT="5300"
 PANEL_DIR="/usr/local/share/slipstream-rust-panel"
 VPN_GROUP="slipstream-users"
@@ -421,8 +422,8 @@ EOF
 SOCKS_AUTH_ENABLED="${SOCKS_AUTH_ENABLED:-no}"
 SOCKS_USERNAME="${SOCKS_USERNAME:-}"
 SOCKS_PASSWORD="${SOCKS_PASSWORD:-}"
-        PANEL_PORT="${PANEL_PORT:-}"
-        PANEL_SECRET="${PANEL_SECRET:-}"
+PANEL_PORT="${PANEL_PORT:-}"
+PANEL_SECRET="${PANEL_SECRET:-}"
 EOF
     fi
 
@@ -1830,6 +1831,15 @@ setup_panel() {
 
     print_status "Setting up management panel..."
 
+    # Ensure git is installed
+    if ! command -v git &> /dev/null; then
+        print_status "Installing git..."
+        case $PKG_MANAGER in
+            dnf|yum) $PKG_MANAGER install -y git ;;
+            apt) apt install -y git ;;
+        esac
+    fi
+
     # Install Python dependencies
     case $PKG_MANAGER in
         dnf|yum)
@@ -1853,13 +1863,20 @@ setup_panel() {
 
     # Ensure panel files are available
     if [[ ! -d "./panel" && ! -d "$BUILD_DIR/panel" ]]; then
-        print_status "Downloading panel files from repository..."
-        mkdir -p "$BUILD_DIR"
-        if [[ ! -d "$BUILD_DIR/.git" ]]; then
-            git clone "$REPO_URL" "$BUILD_DIR"
+        print_status "Downloading panel files from repository: $DEPLOY_REPO_URL"
+        local temp_deploy_dir="/tmp/slipstream-deploy-repo"
+        rm -rf "$temp_deploy_dir"
+        if git clone "$DEPLOY_REPO_URL" "$temp_deploy_dir"; then
+            mkdir -p "$BUILD_DIR"
+            cp -r "$temp_deploy_dir/panel" "$BUILD_DIR/"
+            rm -rf "$temp_deploy_dir"
+            print_status "Successfully downloaded panel files."
         else
-            (cd "$BUILD_DIR" && git pull)
+            print_error "Failed to download panel files from repository."
+            return 1
         fi
+    else
+        print_status "Panel source files already present."
     fi
 
     local source_panel_dir="./panel"
