@@ -37,7 +37,7 @@ Go into your name registrar's configuration panel and add these records:
 
 **One-command installation:**
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/AliRezaBeigy/slipstream-rust-deploy/master/slipstream-rust-deploy.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/aliazading/slipstream-rust-deploy-pnl/master/slipstream-rust-deploy.sh)
 ```
 
 This command will:
@@ -133,17 +133,17 @@ Prebuilt client binaries are available for the following platforms:
 
 | Platform | Download |
 |----------|----------|
-| Linux (x86_64) | [slipstream-client-linux-amd64](https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/slipstream-client-linux-amd64) |
-| Linux (ARM64) | [slipstream-client-linux-arm64](https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/slipstream-client-linux-arm64) |
-| Windows (x86_64) | [slipstream-client-windows-amd64.exe](https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/slipstream-client-windows-amd64.exe) |
-| macOS (ARM64) | [slipstream-client-darwin-arm64](https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/slipstream-client-darwin-arm64) |
-| macOS (Intel) | [slipstream-client-darwin-amd64](https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/slipstream-client-darwin-amd64) |
+| Linux (x86_64) | [slipstream-client-linux-amd64](https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download/slipstream-client-linux-amd64) |
+| Linux (ARM64) | [slipstream-client-linux-arm64](https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download/slipstream-client-linux-arm64) |
+| Windows (x86_64) | [slipstream-client-windows-amd64.exe](https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download/slipstream-client-windows-amd64.exe) |
+| macOS (ARM64) | [slipstream-client-darwin-arm64](https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download/slipstream-client-darwin-arm64) |
+| macOS (Intel) | [slipstream-client-darwin-amd64](https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download/slipstream-client-darwin-amd64) |
 
 ### Quick Start (Linux/macOS)
 
 ```bash
 # Download the client for your platform
-curl -Lo slipstream-client https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/slipstream-client-linux-amd64
+curl -Lo slipstream-client https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download/slipstream-client-linux-amd64
 chmod +x slipstream-client
 
 # Run the client (connects to your server via DNS tunnel)
@@ -154,7 +154,7 @@ chmod +x slipstream-client
 
 ```powershell
 # Download the client
-Invoke-WebRequest -Uri "https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/slipstream-client-windows-amd64.exe" -OutFile "slipstream-client.exe"
+Invoke-WebRequest -Uri "https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download/slipstream-client-windows-amd64.exe" -OutFile "slipstream-client.exe"
 
 # Run the client
 .\slipstream-client.exe --resolver YOUR_SERVER_IP:53 --domain s.example.com

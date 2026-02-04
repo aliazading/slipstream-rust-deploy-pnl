@@ -19,7 +19,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Global variables
-SCRIPT_URL="https://raw.githubusercontent.com/AliRezaBeigy/slipstream-rust-deploy/master/slipstream-rust-deploy.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/aliazading/slipstream-rust-deploy-pnl/master/slipstream-rust-deploy.sh"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/slipstream-rust"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -31,7 +31,7 @@ REPO_URL="https://github.com/Mygod/slipstream-rust.git"
 SLIPSTREAM_PORT="5300"
 PANEL_DIR="/usr/local/share/slipstream-rust-panel"
 VPN_GROUP="slipstream-users"
-RELEASE_URL="https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download"
+RELEASE_URL="https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download"
 
 # Global variable to track if update is available
 UPDATE_AVAILABLE=false
@@ -1058,7 +1058,7 @@ download_prebuilt_binary() {
 
     print_status "Fetching latest release information..."
     local api_response
-    api_response=$(curl -fsSL "https://api.github.com/repos/AliRezaBeigy/slipstream-rust-deploy/releases/latest" 2>/dev/null)
+    api_response=$(curl -fsSL "https://api.github.com/repos/aliazading/slipstream-rust-deploy-pnl/releases/latest" 2>/dev/null)
     
     if [ -n "$api_response" ]; then
         latest_tag=$(echo "$api_response" | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4)
