@@ -320,7 +320,7 @@ sudo journalctl -u slipstream-rust-server -f    # View logs
 
 **Uninstall**:
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/AliRezaBeigy/slipstream-rust-deploy/master/slipstream-rust-deploy.sh) uninstall           # Complete removal of slipstream-rust
+bash <(curl -Ls https://raw.githubusercontent.com/aliazading/slipstream-rust-deploy-pnl/master/slipstream-rust-deploy.sh) uninstall           # Complete removal of slipstream-rust
 ```
 
 **Dante SOCKS Service (SOCKS mode only)**:
@@ -344,7 +344,7 @@ slipstream-rust-deploy
 
 **Method 2: Re-run the curl command**
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/AliRezaBeigy/slipstream-rust-deploy/master/slipstream-rust-deploy.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/aliazading/slipstream-rust-deploy-pnl/master/slipstream-rust-deploy.sh)
 # The script will detect and install updates automatically
 ```
 

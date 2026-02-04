@@ -317,10 +317,11 @@ show_menu() {
     echo "3) Check service status"
     echo "4) View service logs"
     echo "5) Show configuration info"
-    echo "6) Uninstall slipstream-rust"
+    echo "6) Show management panel info"
+    echo "7) Uninstall slipstream-rust"
     echo "0) Exit"
     echo ""
-    print_question "Please select an option (0-6): "
+    print_question "Please select an option (0-7): "
 }
 
 # Function to handle menu selection
@@ -354,6 +355,9 @@ handle_menu() {
                 show_configuration_info
                 ;;
             6)
+                show_panel_info
+                ;;
+            7)
                 if uninstall_slipstream; then
                     exit 0
                 fi
@@ -363,7 +367,7 @@ handle_menu() {
                 exit 0
                 ;;
             *)
-                print_error "Invalid choice. Please enter 0-6."
+                print_error "Invalid choice. Please enter 0-7."
                 ;;
         esac
 
@@ -440,6 +444,44 @@ EOF
     print_status "Configuration saved to $CONFIG_FILE"
 }
 
+# Function to show management panel information
+show_panel_info() {
+    print_status "Management Panel Information"
+    print_status "============================"
+
+    # Check if configuration file exists
+    if [ ! -f "$CONFIG_FILE" ]; then
+        print_warning "No configuration found. Please install/configure slipstream-rust server first."
+        return 1
+    fi
+
+    # Load existing configuration
+    if ! load_existing_config; then
+        print_error "Failed to load configuration from $CONFIG_FILE"
+        return 1
+    fi
+
+    if [[ -z "${PANEL_PORT:-}" ]]; then
+        print_warning "Management panel is not configured or not available for the current mode."
+        return 0
+    fi
+
+    local public_ip
+    public_ip=$(curl -s https://ipinfo.io/ip || echo "YOUR_SERVER_IP")
+
+    echo ""
+    echo -e "${BLUE}Panel Details:${NC}"
+    echo -e "  URL:        ${YELLOW}http://${public_ip}:${PANEL_PORT}/${PANEL_SECRET}/panel/login${NC}"
+    echo -e "  Admin User: ${YELLOW}${SOCKS_USERNAME}${NC}"
+    echo -e "  Admin Pass: ${YELLOW}${SOCKS_PASSWORD}${NC}"
+    echo ""
+    echo -e "${BLUE}Panel Management:${NC}"
+    echo -e "  Status:  ${YELLOW}systemctl status slipstream-panel${NC}"
+    echo -e "  Restart: ${YELLOW}systemctl restart slipstream-panel${NC}"
+    echo -e "  Logs:    ${YELLOW}journalctl -u slipstream-panel -f${NC}"
+    echo ""
+}
+
 # Function to show configuration information
 show_configuration_info() {
     print_status "Current Configuration Information"
@@ -496,6 +538,16 @@ show_configuration_info() {
         echo -e "  Stop:    ${YELLOW}systemctl stop danted${NC}"
         echo -e "  Start:   ${YELLOW}systemctl start danted${NC}"
         echo -e "  Logs:    ${YELLOW}journalctl -u danted -f${NC}"
+
+        if [[ -n "${PANEL_PORT:-}" ]]; then
+            local public_ip
+            public_ip=$(curl -s https://ipinfo.io/ip || echo "YOUR_SERVER_IP")
+            echo ""
+            echo -e "${BLUE}Management Panel Information:${NC}"
+            echo -e "  URL:        ${YELLOW}http://${public_ip}:${PANEL_PORT}/${PANEL_SECRET}/panel/login${NC}"
+            echo -e "  Admin User: ${YELLOW}${SOCKS_USERNAME}${NC}"
+            echo -e "  Admin Pass: ${YELLOW}${SOCKS_PASSWORD}${NC}"
+        fi
     fi
 
     # Show Shadowsocks info if applicable
@@ -1070,8 +1122,8 @@ download_prebuilt_binary() {
     fi
 
     if [ -z "$download_url" ]; then
-        print_warning "Could not fetch release tag from API, trying /latest/download endpoint..."
-        download_url="${RELEASE_URL}/${binary_name}"
+        print_warning "Could not fetch release tag from API, trying main repo as fallback for binaries..."
+        download_url="https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/${binary_name}"
     fi
     print_status "Downloading prebuilt slipstream-server binary from: $download_url"
 
