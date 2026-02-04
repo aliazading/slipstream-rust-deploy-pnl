@@ -1065,7 +1065,7 @@ download_prebuilt_binary() {
         latest_tag=$(echo "$api_response" | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4)
         if [ -n "$latest_tag" ]; then
             print_status "Found latest release tag: $latest_tag"
-            download_url="https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/download/${latest_tag}/${binary_name}"
+            download_url="https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/download/${latest_tag}/${binary_name}"
         fi
     fi
 
