@@ -486,6 +486,28 @@ sudo systemctl restart slipstream-rust-server
 - **Flexible tunneling**: SSH mode or SOCKS proxy mode
 - **Network ready**: Automatic firewall and iptables configuration
 - **TLS certificates**: Automatic generation and management of TLS certificates
+- **User Management Panel**: Simple web-based panel for managing VPN users (SOCKS mode)
+
+
+## User Management Panel (SOCKS Mode)
+
+When you install slipstream-rust in **SOCKS mode** with authentication enabled, the script automatically sets up a management panel.
+
+### Features
+- 🔒 **Secure Access**: Random port and secret URL path.
+- 👥 **User Management**: Add and delete VPN users easily.
+- 🌓 **Dark Mode**: Modern UI with Persian language support.
+- ⚡ **Real-time**: Changes take effect immediately.
+
+### How to Access
+After a successful installation, the script will display your unique Panel URL, Admin Username, and Admin Password.
+The URL will look something like this:
+`http://YOUR_SERVER_IP:PORT/SECRET_PATH/panel/login`
+
+### Management Commands
+- **Check Panel Status**: `systemctl status slipstream-panel`
+- **View Panel Logs**: `journalctl -u slipstream-panel -f`
+- **Restart Panel**: `systemctl restart slipstream-panel`
 
 
 ## Differences from C Implementation

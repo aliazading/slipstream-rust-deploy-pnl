@@ -29,6 +29,8 @@ SCRIPT_INSTALL_PATH="/usr/local/bin/slipstream-rust-deploy"
 BUILD_DIR="/opt/slipstream-rust"
 REPO_URL="https://github.com/Mygod/slipstream-rust.git"
 SLIPSTREAM_PORT="5300"
+PANEL_DIR="/usr/local/share/slipstream-rust-panel"
+VPN_GROUP="slipstream-users"
 RELEASE_URL="https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download"
 
 # Global variable to track if update is available
@@ -175,6 +177,25 @@ uninstall_slipstream() {
         print_status "Removing systemd service file..."
         rm -f "${SYSTEMD_DIR}/slipstream-rust-server.service"
         systemctl daemon-reload
+    fi
+
+    # Stop and disable management panel if running
+    if systemctl is-active --quiet slipstream-panel 2>/dev/null; then
+        print_status "Stopping slipstream-panel service..."
+        systemctl stop slipstream-panel
+    fi
+    if systemctl is-enabled --quiet slipstream-panel 2>/dev/null; then
+        print_status "Disabling slipstream-panel service..."
+        systemctl disable slipstream-panel
+    fi
+    if [ -f "${SYSTEMD_DIR}/slipstream-panel.service" ]; then
+        print_status "Removing slipstream-panel service file..."
+        rm -f "${SYSTEMD_DIR}/slipstream-panel.service"
+        systemctl daemon-reload
+    fi
+    if [ -d "$PANEL_DIR" ]; then
+        print_status "Removing management panel directory..."
+        rm -rf "$PANEL_DIR"
     fi
 
     # Stop and disable Dante if running
@@ -400,6 +421,8 @@ EOF
 SOCKS_AUTH_ENABLED="${SOCKS_AUTH_ENABLED:-no}"
 SOCKS_USERNAME="${SOCKS_USERNAME:-}"
 SOCKS_PASSWORD="${SOCKS_PASSWORD:-}"
+        PANEL_PORT="${PANEL_PORT:-}"
+        PANEL_SECRET="${PANEL_SECRET:-}"
 EOF
     fi
 
@@ -1482,6 +1505,9 @@ configure_firewall() {
         print_status "Configuring active firewalld..."
         firewall-cmd --permanent --add-port="$SLIPSTREAM_PORT"/udp
         firewall-cmd --permanent --add-port=53/udp
+        if [[ -n "${PANEL_PORT:-}" ]]; then
+            firewall-cmd --permanent --add-port="$PANEL_PORT"/tcp
+        fi
         firewall-cmd --reload
         print_status "Firewalld configured successfully"
 
@@ -1490,6 +1516,9 @@ configure_firewall() {
         print_status "Configuring active ufw..."
         ufw allow "$SLIPSTREAM_PORT"/udp
         ufw allow 53/udp
+        if [[ -n "${PANEL_PORT:-}" ]]; then
+            ufw allow "$PANEL_PORT"/tcp
+        fi
         print_status "UFW configured successfully"
 
     else
@@ -1549,15 +1578,22 @@ setup_dante() {
     if [[ "${SOCKS_AUTH_ENABLED:-no}" == "yes" && -n "${SOCKS_USERNAME:-}" && -n "${SOCKS_PASSWORD:-}" ]]; then
         socks_method="username"
         
+        # Create VPN group
+        if ! getent group "$VPN_GROUP" >/dev/null; then
+            groupadd "$VPN_GROUP"
+        fi
+
         if ! id "$SOCKS_USERNAME" &>/dev/null; then
             print_status "Creating system user for SOCKS authentication: $SOCKS_USERNAME"
-            useradd -r -s /bin/false -M "$SOCKS_USERNAME" 2>/dev/null || {
+            useradd -r -s /bin/false -M -G "$VPN_GROUP" "$SOCKS_USERNAME" 2>/dev/null || {
                 print_error "Failed to create system user: $SOCKS_USERNAME"
                 return 1
             }
             print_status "System user created: $SOCKS_USERNAME"
         else
             print_status "System user already exists: $SOCKS_USERNAME"
+            # Ensure user is in group
+            usermod -a -G "$VPN_GROUP" "$SOCKS_USERNAME"
         fi
         
         print_status "Setting password for SOCKS user: $SOCKS_USERNAME"
@@ -1786,6 +1822,93 @@ EOF
     print_status "Encryption method: $SHADOWSOCKS_METHOD"
 }
 
+# Function to setup management panel
+setup_panel() {
+    if [[ "$TUNNEL_MODE" != "socks" || "${SOCKS_AUTH_ENABLED:-no}" != "yes" ]]; then
+        return 0
+    fi
+
+    print_status "Setting up management panel..."
+
+    # Install Python dependencies
+    case $PKG_MANAGER in
+        dnf|yum)
+            $PKG_MANAGER install -y python3 python3-pip
+            ;;
+        apt)
+            apt install -y python3 python3-pip python3-venv
+            ;;
+    esac
+
+    # Generate random port and secret if not already set
+    if [[ -z "${PANEL_PORT:-}" ]]; then
+        PANEL_PORT=$(shuf -i 10000-65000 -n 1)
+    fi
+    if [[ -z "${PANEL_SECRET:-}" ]]; then
+        PANEL_SECRET=$(openssl rand -hex 12)
+    fi
+
+    # Create panel directory
+    mkdir -p "$PANEL_DIR"
+
+    # Ensure panel files are available
+    if [[ ! -d "./panel" && ! -d "$BUILD_DIR/panel" ]]; then
+        print_status "Downloading panel files from repository..."
+        mkdir -p "$BUILD_DIR"
+        if [[ ! -d "$BUILD_DIR/.git" ]]; then
+            git clone "$REPO_URL" "$BUILD_DIR"
+        else
+            (cd "$BUILD_DIR" && git pull)
+        fi
+    fi
+
+    local source_panel_dir="./panel"
+    if [[ ! -d "$source_panel_dir" ]]; then
+        source_panel_dir="$BUILD_DIR/panel"
+    fi
+
+    if [[ -d "$source_panel_dir" ]]; then
+        cp -r "$source_panel_dir"/* "$PANEL_DIR/"
+    else
+        print_error "Panel source directory not found!"
+        return 1
+    fi
+
+    # Create virtual environment and install requirements
+    if [ ! -d "$PANEL_DIR/venv" ]; then
+        python3 -m venv "$PANEL_DIR/venv"
+    fi
+    "$PANEL_DIR/venv/bin/pip" install -r "$PANEL_DIR/requirements.txt"
+
+    # Create systemd service for panel
+    cat > "${SYSTEMD_DIR}/slipstream-panel.service" << EOF
+[Unit]
+Description=slipstream-rust Management Panel
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$PANEL_DIR
+Environment="PANEL_PORT=$PANEL_PORT"
+Environment="PANEL_PATH=$PANEL_SECRET/panel"
+Environment="ADMIN_USER=$SOCKS_USERNAME"
+Environment="ADMIN_PASS=$SOCKS_PASSWORD"
+ExecStart=$PANEL_DIR/venv/bin/python $PANEL_DIR/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable slipstream-panel
+    systemctl restart slipstream-panel
+
+    print_status "Management panel started on port $PANEL_PORT"
+}
+
 # Function to create systemd service
 create_systemd_service() {
     print_status "Creating systemd service..."
@@ -1892,6 +2015,9 @@ print_success_box() {
     local header_color='\033[1;36m'  # Cyan for headers
     local reset='\033[0m'
 
+    local public_ip
+    public_ip=$(curl -s https://ipinfo.io/ip || echo "YOUR_SERVER_IP")
+
     echo ""
     # Top border
     echo -e "${border_color}+================================================================================${reset}"
@@ -1934,6 +2060,18 @@ print_success_box() {
         echo -e "  ${text_color}Stop:    systemctl stop danted${reset}"
         echo -e "  ${text_color}Start:   systemctl start danted${reset}"
         echo -e "  ${text_color}Logs:    journalctl -u danted -f${reset}"
+
+        if [[ -n "${PANEL_PORT:-}" ]]; then
+            echo ""
+            echo -e "${header_color}Management Panel Information:${reset}"
+            echo -e "  ${text_color}Panel URL: ${key_color}http://${public_ip}:${PANEL_PORT}/${PANEL_SECRET}/panel/login${reset}"
+            echo -e "  ${text_color}Admin User: ${key_color}${SOCKS_USERNAME}${reset}"
+            echo -e "  ${text_color}Admin Pass: ${key_color}${SOCKS_PASSWORD}${reset}"
+            echo ""
+            echo -e "${text_color}Panel commands:${reset}"
+            echo -e "  ${text_color}Status:  systemctl status slipstream-panel${reset}"
+            echo -e "  ${text_color}Logs:    journalctl -u slipstream-panel -f${reset}"
+        fi
     fi
 
     # Shadowsocks info if applicable
@@ -2071,7 +2209,10 @@ main() {
     # Generate certificates
     generate_certificates
 
-    # Save configuration after certificates are generated
+    # Setup management panel
+    setup_panel
+
+    # Save configuration after everything is set up
     save_config
 
     # Configure firewall and iptables
