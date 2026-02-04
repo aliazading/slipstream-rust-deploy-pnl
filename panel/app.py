@@ -45,6 +45,13 @@ def init_db():
                     total_bytes BIGINT DEFAULT 0
                 )
             ''')
+            # Migration for existing tables
+            cursor = conn.execute('PRAGMA table_info(users)')
+            columns = [row['name'] for row in cursor.fetchall()]
+            if 'expiry_date' not in columns:
+                conn.execute('ALTER TABLE users ADD COLUMN expiry_date DATETIME')
+            if 'total_bytes' not in columns:
+                conn.execute('ALTER TABLE users ADD COLUMN total_bytes BIGINT DEFAULT 0')
 
 init_db()
 
