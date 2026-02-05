@@ -24,6 +24,8 @@ INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/slipstream-rust"
 SYSTEMD_DIR="/etc/systemd/system"
 SLIPSTREAM_USER="slipstream"
+PANEL_DIR="/usr/local/share/slipstream-rust-panel"
+VPN_GROUP="slipstream-users"
 CONFIG_FILE="${CONFIG_DIR}/slipstream-rust-server.conf"
 SCRIPT_INSTALL_PATH="/usr/local/bin/slipstream-rust-deploy"
 BUILD_DIR="/opt/slipstream-rust"
@@ -403,6 +405,13 @@ SOCKS_PASSWORD="${SOCKS_PASSWORD:-}"
 EOF
     fi
 
+    if [[ -n "${PANEL_PORT:-}" ]]; then
+        cat >> "$CONFIG_FILE" << EOF
+PANEL_PORT="$PANEL_PORT"
+PANEL_SECRET="$PANEL_SECRET"
+EOF
+    fi
+
     if [ "$TUNNEL_MODE" = "shadowsocks" ]; then
         cat >> "$CONFIG_FILE" << EOF
 SHADOWSOCKS_PORT="${SHADOWSOCKS_PORT:-8388}"
@@ -472,6 +481,19 @@ show_configuration_info() {
         echo -e "  Stop:    ${YELLOW}systemctl stop danted${NC}"
         echo -e "  Start:   ${YELLOW}systemctl start danted${NC}"
         echo -e "  Logs:    ${YELLOW}journalctl -u danted -f${NC}"
+    fi
+
+    if [[ -n "${PANEL_PORT:-}" ]]; then
+        local public_ip
+        public_ip=$(curl -s https://ipinfo.io/ip || echo "YOUR_SERVER_IP")
+        echo ""
+        echo -e "${BLUE}Management Panel Information:${NC}"
+        echo -e "  URL:        ${YELLOW}http://${public_ip}:${PANEL_PORT}/${PANEL_SECRET}/panel/login${NC}"
+        echo -e "  Admin User: ${YELLOW}${SOCKS_USERNAME:-admin}${NC}"
+        echo -e "  Admin Pass: ${YELLOW}${SOCKS_PASSWORD:-admin}${NC}"
+        echo -e "${BLUE}Panel service commands:${NC}"
+        echo -e "  Status:  ${YELLOW}systemctl status slipstream-panel${NC}"
+        echo -e "  Logs:    ${YELLOW}journalctl -u slipstream-panel -f${NC}"
     fi
 
     # Show Shadowsocks info if applicable
@@ -1482,6 +1504,9 @@ configure_firewall() {
         print_status "Configuring active firewalld..."
         firewall-cmd --permanent --add-port="$SLIPSTREAM_PORT"/udp
         firewall-cmd --permanent --add-port=53/udp
+        if [[ -n "${PANEL_PORT:-}" ]]; then
+            firewall-cmd --permanent --add-port="$PANEL_PORT"/tcp
+        fi
         firewall-cmd --reload
         print_status "Firewalld configured successfully"
 
@@ -1490,6 +1515,9 @@ configure_firewall() {
         print_status "Configuring active ufw..."
         ufw allow "$SLIPSTREAM_PORT"/udp
         ufw allow 53/udp
+        if [[ -n "${PANEL_PORT:-}" ]]; then
+            ufw allow "$PANEL_PORT"/tcp
+        fi
         print_status "UFW configured successfully"
 
     else
@@ -1549,15 +1577,22 @@ setup_dante() {
     if [[ "${SOCKS_AUTH_ENABLED:-no}" == "yes" && -n "${SOCKS_USERNAME:-}" && -n "${SOCKS_PASSWORD:-}" ]]; then
         socks_method="username"
         
+        # Create VPN group
+        if ! getent group "$VPN_GROUP" >/dev/null; then
+            groupadd "$VPN_GROUP"
+        fi
+
         if ! id "$SOCKS_USERNAME" &>/dev/null; then
             print_status "Creating system user for SOCKS authentication: $SOCKS_USERNAME"
-            useradd -r -s /bin/false -M "$SOCKS_USERNAME" 2>/dev/null || {
+            useradd -r -s /bin/false -M -G "$VPN_GROUP" "$SOCKS_USERNAME" 2>/dev/null || {
                 print_error "Failed to create system user: $SOCKS_USERNAME"
                 return 1
             }
             print_status "System user created: $SOCKS_USERNAME"
         else
             print_status "System user already exists: $SOCKS_USERNAME"
+            # Ensure user is in group
+            usermod -a -G "$VPN_GROUP" "$SOCKS_USERNAME"
         fi
         
         print_status "Setting password for SOCKS user: $SOCKS_USERNAME"
@@ -1636,6 +1671,397 @@ EOF
     else
         print_status "SOCKS authentication: disabled"
     fi
+}
+
+# Function to create panel files
+create_panel_files() {
+    print_status "Creating management panel files..."
+    mkdir -p "$PANEL_DIR/templates"
+
+    cat > "$PANEL_DIR/app.py" << 'EOF'
+import os
+import subprocess
+from flask import Flask, render_template, request, redirect, url_for, flash, session
+from functools import wraps
+from flask_wtf.csrf import CSRFProtect
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24).hex())
+csrf = CSRFProtect(app)
+
+# Configuration
+ADMIN_USER = os.environ.get('ADMIN_USER', 'admin')
+ADMIN_PASS = os.environ.get('ADMIN_PASS', 'admin')
+PANEL_PATH = os.environ.get('PANEL_PATH', 'panel').strip('/')
+VPN_GROUP = "slipstream-users"
+USER_PREFIX = "ss_"
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('logged_in'):
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def get_vpn_users():
+    users = []
+    try:
+        # Get users in the specific group
+        result = subprocess.run(['getent', 'group', VPN_GROUP], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout:
+            parts = result.stdout.strip().split(':')
+            if len(parts) >= 4 and parts[3]:
+                user_list = parts[3].split(',')
+                for u in user_list:
+                    if u.startswith(USER_PREFIX):
+                        # Check if user is locked
+                        status_res = subprocess.run(['passwd', '-S', u], capture_output=True, text=True)
+                        is_enabled = True
+                        if status_res.returncode == 0:
+                            status_info = status_res.stdout.split()
+                            if len(status_info) >= 2 and status_info[1] == 'L':
+                                is_enabled = False
+                        users.append({'username': u, 'enabled': is_enabled})
+    except Exception as e:
+        app.logger.error(f"Error getting users: {e}")
+    return sorted(users, key=lambda x: x['username'])
+
+@app.route(f'/{PANEL_PATH}/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        if username == ADMIN_USER and password == ADMIN_PASS:
+            session['logged_in'] = True
+            return redirect(url_for('dashboard'))
+        flash('نام کاربری یا رمز عبور اشتباه است', 'danger')
+    return render_template('login.html', panel_path=PANEL_PATH)
+
+@app.route(f'/{PANEL_PATH}/logout')
+def logout():
+    session.pop('logged_in', None)
+    return redirect(url_for('login'))
+
+@app.route(f'/{PANEL_PATH}/')
+@app.route(f'/{PANEL_PATH}/dashboard')
+@login_required
+def dashboard():
+    users = get_vpn_users()
+    return render_template('dashboard.html', users=users, panel_path=PANEL_PATH, prefix=USER_PREFIX)
+
+@app.route(f'/{PANEL_PATH}/add_user', methods=['POST'])
+@login_required
+def add_user():
+    username = request.form.get('username')
+    password = request.form.get('password')
+
+    if not username or not password:
+        flash('نام کاربری و رمز عبور الزامی است', 'warning')
+        return redirect(url_for('dashboard'))
+
+    if not username.startswith(USER_PREFIX):
+        username = USER_PREFIX + username
+
+    try:
+        check_user = subprocess.run(['id', username], capture_output=True)
+        if check_user.returncode == 0:
+            flash(f'کاربر {username} از قبل وجود دارد', 'danger')
+            return redirect(url_for('dashboard'))
+
+        subprocess.run(['useradd', '-r', '-s', '/bin/false', '-M', '-G', VPN_GROUP, username], check=True)
+        process = subprocess.Popen(['chpasswd'], stdin=subprocess.PIPE, text=True)
+        process.communicate(input=f'{username}:{password}')
+
+        flash(f'کاربر {username} با موفقیت ساخته شد', 'success')
+    except Exception as e:
+        flash(f'خطا در ساخت کاربر: {str(e)}', 'danger')
+
+    return redirect(url_for('dashboard'))
+
+@app.route(f'/{PANEL_PATH}/toggle_user/<username>', methods=['POST'])
+@login_required
+def toggle_user(username):
+    if not username.startswith(USER_PREFIX):
+        flash('خطا در شناسایی کاربر', 'danger')
+        return redirect(url_for('dashboard'))
+
+    try:
+        status_res = subprocess.run(['passwd', '-S', username], capture_output=True, text=True)
+        if status_res.returncode == 0:
+            status_info = status_res.stdout.split()
+            is_locked = len(status_info) >= 2 and status_info[1] == 'L'
+
+            if is_locked:
+                subprocess.run(['usermod', '-U', username], check=True)
+                flash(f'کاربر {username} فعال شد', 'success')
+            else:
+                subprocess.run(['usermod', '-L', username], check=True)
+                flash(f'کاربر {username} غیرفعال شد', 'success')
+        else:
+            flash('خطا در دریافت وضعیت کاربر', 'danger')
+    except Exception as e:
+        flash(f'خطا: {str(e)}', 'danger')
+
+    return redirect(url_for('dashboard'))
+
+@app.route(f'/{PANEL_PATH}/delete_user/<username>', methods=['POST'])
+@login_required
+def delete_user(username):
+    if not username.startswith(USER_PREFIX):
+        flash('فقط کاربران وی‌پی‌ان قابل حذف هستند', 'danger')
+        return redirect(url_for('dashboard'))
+
+    try:
+        subprocess.run(['userdel', username], check=True)
+        flash(f'کاربر {username} با موفقیت حذف شد', 'success')
+    except Exception as e:
+        flash(f'خطا در حذف کاربر: {str(e)}', 'danger')
+
+    return redirect(url_for('dashboard'))
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PANEL_PORT', 17066))
+    app.run(host='0.0.0.0', port=port)
+EOF
+
+    cat > "$PANEL_DIR/templates/login.html" << 'EOF'
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ورود به پنل مدیریت</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.rtl.min.css">
+    <style>
+        body { background-color: #121212; color: #e0e0e0; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        .login-card { background-color: #1e1e1e; border: 1px solid #333; border-radius: 10px; padding: 30px; width: 100%; max-width: 400px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+        .form-control { background-color: #2c2c2c; border-color: #444; color: #fff; }
+        .form-control:focus { background-color: #333; color: #fff; border-color: #0d6efd; box-shadow: none; }
+        .btn-primary { background-color: #0d6efd; border: none; }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <h4 class="text-center mb-4">ورود به مدیریت Slipstream</h4>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for category, message in messages %}
+              <div class="alert alert-{{ category }} py-2">{{ message }}</div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
+        <form method="POST">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div class="mb-3">
+                <label for="username" class="form-label">نام کاربری</label>
+                <input type="text" name="username" class="form-control" id="username" required>
+            </div>
+            <div class="mb-3">
+                <label for="password" class="form-label">رمز عبور</label>
+                <input type="password" name="password" class="form-control" id="password" required>
+            </div>
+            <button type="submit" class="btn btn-primary w-100">ورود</button>
+        </form>
+    </div>
+</body>
+</html>
+EOF
+
+    cat > "$PANEL_DIR/templates/dashboard.html" << 'EOF'
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>پنل مدیریت کاربران</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.rtl.min.css">
+    <style>
+        body { background-color: #121212; color: #e0e0e0; }
+        .navbar { background-color: #1e1e1e; border-bottom: 1px solid #333; }
+        .card { background-color: #1e1e1e; border: 1px solid #333; margin-bottom: 20px; }
+        .table { color: #e0e0e0; }
+        .table thead th { border-bottom: 2px solid #333; color: #fff; background-color: #2c2c2c; }
+        .table td { border-bottom: 1px solid #222; }
+        .form-control { background-color: #2c2c2c; border-color: #444; color: #fff; }
+        .form-control:focus { background-color: #333; color: #fff; border-color: #0d6efd; box-shadow: none; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark mb-4">
+        <div class="container">
+            <a class="navbar-brand" href="#">مدیریت کاربران Slipstream</a>
+            <div class="ms-auto">
+                <a href="{{ url_for('logout') }}" class="btn btn-outline-danger btn-sm">خروج</a>
+            </div>
+        </div>
+    </nav>
+    <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for category, message in messages %}
+              <div class="alert alert-{{ category }} alert-dismissible fade show">
+                {{ message }}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+              </div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
+        <div class="row">
+            <div class="col-md-4">
+                <div class="card p-4">
+                    <h5>افزودن کاربر جدید</h5>
+                    <hr>
+                    <form action="{{ url_for('add_user') }}" method="POST">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <div class="mb-3">
+                            <label for="username" class="form-label">نام کاربری</label>
+                            <div class="input-group" dir="ltr">
+                                <span class="input-group-text bg-secondary text-white">{{ prefix }}</span>
+                                <input type="text" name="username" class="form-control" id="username" placeholder="user1" required>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label for="password" class="form-label">رمز عبور</label>
+                            <input type="password" name="password" class="form-control" id="password" required>
+                        </div>
+                        <button type="submit" class="btn btn-success w-100">افزودن</button>
+                    </form>
+                </div>
+            </div>
+            <div class="col-md-8">
+                <div class="card p-4">
+                    <h5>لیست کاربران وی‌پی‌ان</h5>
+                    <hr>
+                    <div class="table-responsive">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>نام کاربری</th>
+                                    <th>وضعیت</th>
+                                    <th>عملیات</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for user in users %}
+                                <tr>
+                                    <td class="align-middle" dir="ltr">{{ user.username }}</td>
+                                    <td class="align-middle">
+                                        {% if user.enabled %}
+                                            <span class="badge bg-success">فعال</span>
+                                        {% else %}
+                                            <span class="badge bg-danger">غیرفعال</span>
+                                        {% endif %}
+                                    </td>
+                                    <td>
+                                        <div class="d-flex gap-2">
+                                            <form action="{{ url_for('toggle_user', username=user.username) }}" method="POST">
+                                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                                {% if user.enabled %}
+                                                    <button type="submit" class="btn btn-warning btn-sm">غیرفعال‌سازی</button>
+                                                {% else %}
+                                                    <button type="submit" class="btn btn-info btn-sm text-white">فعال‌سازی</button>
+                                                {% endif %}
+                                            </form>
+                                            <form action="{{ url_for('delete_user', username=user.username) }}" method="POST" onsubmit="return confirm('آیا از حذف این کاربر اطمینان دارید؟');">
+                                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                                <button type="submit" class="btn btn-danger btn-sm">حذف</button>
+                                            </form>
+                                        </div>
+                                    </td>
+                                </tr>
+                                {% else %}
+                                <tr><td colspan="3" class="text-center">کاربری یافت نشد</td></tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+EOF
+
+    cat > "$PANEL_DIR/requirements.txt" << 'EOF'
+Flask==2.3.3
+Flask-WTF==1.1.1
+Werkzeug==2.3.7
+EOF
+}
+
+# Function to setup management panel
+setup_panel() {
+    # Panel is only supported for modes that use system users (SOCKS/SSH)
+    if [[ "$TUNNEL_MODE" != "socks" && "$TUNNEL_MODE" != "ssh" ]]; then
+        return 0
+    fi
+
+    print_status "Setting up management panel..."
+
+    # Install Python dependencies
+    case $PKG_MANAGER in
+        dnf|yum)
+            $PKG_MANAGER install -y python3 python3-pip
+            ;;
+        apt)
+            apt install -y python3 python3-pip python3-venv
+            ;;
+    esac
+
+    # Generate random port and secret if not already set
+    if [[ -z "${PANEL_PORT:-}" ]]; then
+        PANEL_PORT=$(shuf -i 10000-65000 -n 1)
+    fi
+    if [[ -z "${PANEL_SECRET:-}" ]]; then
+        PANEL_SECRET=$(openssl rand -hex 12)
+    fi
+
+    # Create panel directory and files
+    mkdir -p "$PANEL_DIR"
+    create_panel_files
+
+    # Create virtual environment and install requirements
+    if [ ! -d "$PANEL_DIR/venv" ]; then
+        python3 -m venv "$PANEL_DIR/venv"
+    fi
+    "$PANEL_DIR/venv/bin/pip" install -r "$PANEL_DIR/requirements.txt"
+
+    # Create VPN group
+    if ! getent group "$VPN_GROUP" >/dev/null; then
+        groupadd "$VPN_GROUP"
+    fi
+
+    # Create systemd service for panel
+    cat > "${SYSTEMD_DIR}/slipstream-panel.service" << EOF
+[Unit]
+Description=slipstream-rust Management Panel
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$PANEL_DIR
+Environment="PANEL_PORT=$PANEL_PORT"
+Environment="PANEL_PATH=$PANEL_SECRET/panel"
+Environment="ADMIN_USER=${SOCKS_USERNAME:-admin}"
+Environment="ADMIN_PASS=${SOCKS_PASSWORD:-admin}"
+ExecStart=$PANEL_DIR/venv/bin/python $PANEL_DIR/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable slipstream-panel
+    systemctl restart slipstream-panel
+
+    print_status "Management panel started on port $PANEL_PORT"
+    print_status "Panel path: /$PANEL_SECRET/panel"
 }
 
 # Function to install and configure Shadowsocks
@@ -1936,6 +2362,20 @@ print_success_box() {
         echo -e "  ${text_color}Logs:    journalctl -u danted -f${reset}"
     fi
 
+    if [[ -n "${PANEL_PORT:-}" ]]; then
+        local public_ip
+        public_ip=$(curl -s https://ipinfo.io/ip || echo "YOUR_SERVER_IP")
+        echo ""
+        echo -e "${header_color}Management Panel Information:${reset}"
+        echo -e "  ${text_color}URL:        ${key_color}http://${public_ip}:${PANEL_PORT}/${PANEL_SECRET}/panel/login${reset}"
+        echo -e "  ${text_color}Admin User: ${key_color}${SOCKS_USERNAME:-admin}${reset}"
+        echo -e "  ${text_color}Admin Pass: ${key_color}${SOCKS_PASSWORD:-admin}${reset}"
+        echo ""
+        echo -e "${text_color}Panel service commands:${reset}"
+        echo -e "  ${text_color}Status:  systemctl status slipstream-panel${reset}"
+        echo -e "  ${text_color}Logs:    journalctl -u slipstream-panel -f${reset}"
+    fi
+
     # Shadowsocks info if applicable
     if [ "$TUNNEL_MODE" = "shadowsocks" ]; then
         echo ""
@@ -2071,7 +2511,10 @@ main() {
     # Generate certificates
     generate_certificates
 
-    # Save configuration after certificates are generated
+    # Setup management panel
+    setup_panel
+
+    # Save configuration after everything is set up
     save_config
 
     # Configure firewall and iptables
@@ -2081,7 +2524,7 @@ main() {
     case "$TUNNEL_MODE" in
         socks)
             setup_dante
-            # Stop Shadowsocks if it was running
+            # Stop Shadowsocks if it was flowering
             if systemctl is-active --quiet shadowsocks-libev-server@config 2>/dev/null; then
                 print_status "Switching to SOCKS mode - stopping Shadowsocks service..."
                 systemctl stop shadowsocks-libev-server@config
