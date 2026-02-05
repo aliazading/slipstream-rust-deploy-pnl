@@ -1603,6 +1603,10 @@ setup_dante() {
         print_status "Password set successfully for SOCKS user"
     fi
 
+    # Ensure log file exists for Dante
+    touch /var/log/danted.log
+    chmod 666 /var/log/danted.log
+
     # Configure Dante
     cat > /etc/danted.conf << EOF
 # Dante SOCKS server configuration
@@ -1817,14 +1821,11 @@ def update_traffic_from_logs():
                 if current_size > last_offset:
                     with open(DANTE_LOG, 'r') as f:
                         f.seek(last_offset)
-                        lines = f.readlines()
-                        last_offset = f.tell()
-
                         conn = sqlite3.connect(DB_PATH)
                         c = conn.cursor()
-                        for line in lines:
-                            # More flexible regex to handle Dante's log format variants
-                            match = re.search(r'user\s+([^,:\s]+)[,:]\s+(\d+)\s+bytes\s+uploaded,\s+(\d+)\s+bytes\s+downloaded', line)
+                        for line in f:
+                            # Robust regex for different Dante versions and formats
+                            match = re.search(r'user\s+["\']?([^"\'\s,:]+)["\']?.*?\s+(\d+)\s+bytes?\s+(?:uploaded|sent|out).*?(\d+)\s+bytes?\s+(?:downloaded|received|in)', line, re.IGNORECASE)
                             if match:
                                 username, uploaded, downloaded = match.groups()
                                 if username.startswith(USER_PREFIX):
@@ -1833,8 +1834,9 @@ def update_traffic_from_logs():
                                               (int(uploaded), int(downloaded), username))
                         conn.commit()
                         conn.close()
+                    last_offset = current_size
         except Exception as e:
-            pass
+            app.logger.error(f"Traffic thread error: {e}")
         time.sleep(10)
 
 def check_expirations():
@@ -2241,10 +2243,6 @@ setup_panel() {
     # Create panel directory and files
     mkdir -p "$PANEL_DIR"
     create_panel_files
-
-    # Ensure log file exists and is accessible
-    touch /var/log/danted.log
-    chmod 666 /var/log/danted.log
 
     # Create virtual environment and install requirements
     if [ ! -d "$PANEL_DIR/venv" ]; then
