@@ -53,9 +53,6 @@
             border-color: #0d6efd;
             box-shadow: none;
         }
-        .btn-close-white {
-            filter: invert(1) grayscale(100%) brightness(200%);
-        }
     </style>
 </head>
 <body>
@@ -99,10 +96,6 @@
                             <label for="password" class="form-label">رمز عبور</label>
                             <input type="password" name="password" class="form-control" id="password" required>
                         </div>
-                        <div class="mb-3">
-                            <label for="duration" class="form-label">مدت اعتبار (روز)</label>
-                            <input type="number" name="duration" class="form-control" id="duration" placeholder="30" value="30">
-                        </div>
                         <button type="submit" class="btn btn-success w-100">افزودن</button>
                     </form>
                 </div>
@@ -119,9 +112,6 @@
                                 <tr>
                                     <th>نام کاربری</th>
                                     <th>وضعیت</th>
-                                    <th>آنلاین</th>
-                                    <th>مصرف</th>
-                                    <th>تاریخ انقضا</th>
                                     <th>عملیات</th>
                                 </tr>
                             </thead>
@@ -136,27 +126,6 @@
                                             <span class="badge bg-danger">غیرفعال</span>
                                         {% endif %}
                                     </td>
-                                    <td class="align-middle">
-                                        {% if user.is_online %}
-                                            <span class="badge rounded-pill bg-success">Online</span>
-                                        {% else %}
-                                            <span class="badge rounded-pill bg-secondary">Offline</span>
-                                        {% endif %}
-                                    </td>
-                                    <td class="align-middle" dir="ltr">
-                                        {{ user.formatted_usage }}
-                                        <form action="{{ url_for('reset_usage', username=user.username) }}" method="POST" class="d-inline">
-                                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                            <button type="submit" class="btn btn-link btn-sm p-0" title="ریست حجم">🔄</button>
-                                        </form>
-                                    </td>
-                                    <td class="align-middle" dir="ltr">
-                                        {% if user.expiry_date %}
-                                            {{ user.expiry_date.split('.')[0] }}
-                                        {% else %}
-                                            <span class="text-muted">نامحدود</span>
-                                        {% endif %}
-                                    </td>
                                     <td>
                                         <div class="d-flex gap-1">
                                             <form action="{{ url_for('toggle_user', username=user.username) }}" method="POST">
@@ -165,38 +134,10 @@
                                                     {{ 'غیرفعال' if user.is_active else 'فعال' }}
                                                 </button>
                                             </form>
-                                            <button type="button" class="btn btn-info btn-sm" data-bs-toggle="modal" data-bs-target="#resetModal{{ loop.index }}">
-                                                تمدید
-                                            </button>
                                             <form action="{{ url_for('delete_user', username=user.username) }}" method="POST" onsubmit="return confirm('آیا از حذف این کاربر اطمینان دارید؟');">
                                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                                 <button type="submit" class="btn btn-danger btn-sm">حذف</button>
                                             </form>
-                                        </div>
-
-                                        <!-- Reset Modal -->
-                                        <div class="modal fade" id="resetModal{{ loop.index }}" tabindex="-1" aria-hidden="true">
-                                          <div class="modal-dialog">
-                                            <div class="modal-content bg-dark border-secondary">
-                                              <div class="modal-header border-secondary">
-                                                <h5 class="modal-title">تمدید زمان کاربر {{ user.username }}</h5>
-                                                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
-                                              </div>
-                                              <form action="{{ url_for('reset_time', username=user.username) }}" method="POST">
-                                                <div class="modal-body">
-                                                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                                  <div class="mb-3">
-                                                    <label class="form-label">مدت تمدید (روز)</label>
-                                                    <input type="number" name="duration" class="form-control" value="30" required>
-                                                  </div>
-                                                </div>
-                                                <div class="modal-footer border-secondary">
-                                                  <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">انصراف</button>
-                                                  <button type="submit" class="btn btn-primary">تمدید زمان</button>
-                                                </div>
-                                              </form>
-                                            </div>
-                                          </div>
                                         </div>
                                     </td>
                                 </tr>

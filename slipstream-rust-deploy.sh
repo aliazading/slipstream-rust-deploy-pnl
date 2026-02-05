@@ -1670,9 +1670,8 @@ setup_dante() {
     # Configure Dante
     cat > /etc/danted.conf << EOF
 # Dante SOCKS server configuration
-logoutput: /var/log/danted.log
+logoutput: stderr
 user.privileged: root
-user.unprivileged: nobody
 
 # Internal interface (where clients connect)
 internal: 127.0.0.1 port = 1080
@@ -1697,12 +1696,9 @@ client pass {
 }
 
 # SOCKS rules - allow SOCKS requests to anywhere
-cat >> /etc/danted.conf << EOF
 socks pass {
     from: 127.0.0.0/8 to: 0.0.0.0/0
     command: bind connect udpassociate
-    # session.state.key: user
-    # session.max: 1
 EOF
 
     if [[ "$socks_method" == "username" ]]; then
@@ -1712,7 +1708,7 @@ EOF
     fi
 
     cat >> /etc/danted.conf << EOF
-    log: connect disconnect data error
+    log: connect disconnect error
 }
 
 # Block IPv6 if not properly configured
