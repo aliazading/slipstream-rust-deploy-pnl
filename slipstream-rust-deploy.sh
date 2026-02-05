@@ -1697,11 +1697,12 @@ client pass {
 }
 
 # SOCKS rules - allow SOCKS requests to anywhere
+cat >> /etc/danted.conf << EOF
 socks pass {
     from: 127.0.0.0/8 to: 0.0.0.0/0
     command: bind connect udpassociate
-    session.state.key: user
-    session.max: 1
+    # session.state.key: user
+    # session.max: 1
 EOF
 
     if [[ "$socks_method" == "username" ]]; then
