@@ -1643,7 +1643,7 @@ socks pass {
     command: bind connect udpassociate
 EOF
 
-    if [[ -n "$passwd_file" ]]; then
+    if [[ "$socks_method" == "username" ]]; then
         cat >> /etc/danted.conf << EOF
     method: username
 EOF
@@ -1708,6 +1708,7 @@ USER_PREFIX = "ss_"
 DB_PATH = os.path.join(os.path.dirname(__file__), 'panel.db')
 DANTE_LOG = "/var/log/danted.log"
 ONLINE_SESSIONS = {} # {username: count}
+LAST_LOG_PROCESS = "هرگز"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -1811,9 +1812,8 @@ def get_vpn_users():
 
 def update_traffic_from_logs():
     global ONLINE_SESSIONS
+    # Start from 0 to catch historical traffic and currently online users on startup
     last_offset = 0
-    if os.path.exists(DANTE_LOG):
-        last_offset = os.path.getsize(DANTE_LOG)
 
     while True:
         try:
@@ -1823,34 +1823,53 @@ def update_traffic_from_logs():
                     last_offset = 0
 
                 if current_size > last_offset:
-                    with open(DANTE_LOG, 'r') as f:
+                    with open(DANTE_LOG, 'r', errors='replace') as f:
                         f.seek(last_offset)
                         conn = sqlite3.connect(DB_PATH)
                         c = conn.cursor()
                         for line in f:
-                            # 1. Look for user in the line
-                            user_match = re.search(r'user\s+["\']?([^"\'\s,:@.]+)', line, re.IGNORECASE)
-                            if user_match:
-                                username = user_match.group(1)
-                                if username.startswith(USER_PREFIX):
-                                    # 2. Check for connection status
-                                    if 'connect' in line.lower() and ('pass' in line.lower() or 'accepted' in line.lower()):
-                                        ONLINE_SESSIONS[username] = ONLINE_SESSIONS.get(username, 0) + 1
-                                    elif 'disconnect' in line.lower():
-                                        ONLINE_SESSIONS[username] = max(0, ONLINE_SESSIONS.get(username, 0) - 1)
+                            # 1. Look for user in the line - handles "user ss_name" or "user: ss_name"
+                            user_match = re.search(r'user\s*[:\s]\s*(\S+)', line, re.IGNORECASE)
+                            if not user_match:
+                                continue
 
-                                        # 3. Extract traffic on disconnect
-                                        traffic_match = re.search(r'(\d+)\s+bytes?\s+(?:uploaded|received|in).*?(\d+)\s+bytes?\s+(?:downloaded|sent|out)', line, re.IGNORECASE)
-                                        if traffic_match:
-                                            uploaded, downloaded = traffic_match.groups()
-                                            c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
-                                            # bytes_received = uploaded (from client)
-                                            # bytes_sent = downloaded (to client)
-                                            c.execute("UPDATE users SET bytes_sent = bytes_sent + ?, bytes_received = bytes_received + ? WHERE username = ?",
-                                                      (int(downloaded), int(uploaded), username))
+                            username = user_match.group(1).strip('"\':,')
+                            if not username.startswith(USER_PREFIX):
+                                continue
+
+                            line_lower = line.lower()
+                            # 2. Check for connection status
+                            if 'connect' in line_lower and ('pass' in line_lower or 'accepted' in line_lower):
+                                ONLINE_SESSIONS[username] = ONLINE_SESSIONS.get(username, 0) + 1
+                            elif 'disconnect' in line_lower:
+                                ONLINE_SESSIONS[username] = max(0, ONLINE_SESSIONS.get(username, 0) - 1)
+
+                                # 3. Extract traffic on disconnect
+                                # Dante usually logs: X bytes uploaded, Y bytes downloaded
+                                # Or: X bytes in, Y bytes out
+                                up = 0
+                                down = 0
+                                traffic_parts = re.findall(r'(\d+)\s+bytes?\s+(\w+)', line_lower)
+                                for val, label in traffic_parts:
+                                    if label in ['uploaded', 'sent', 'out', 'in']:
+                                        # Map Dante labels to direction
+                                        # 'uploaded' or 'in' (from client to server)
+                                        # 'downloaded' or 'out' (from server to client)
+                                        if label in ['uploaded', 'in']:
+                                            up = int(val)
+                                        else:
+                                            down = int(val)
+
+                                if up > 0 or down > 0:
+                                    c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
+                                    c.execute("UPDATE users SET bytes_sent = bytes_sent + ?, bytes_received = bytes_received + ? WHERE username = ?",
+                                              (down, up, username))
                         conn.commit()
                         conn.close()
                     last_offset = current_size
+
+                global LAST_LOG_PROCESS
+                LAST_LOG_PROCESS = datetime.now().strftime('%H:%M:%S')
         except Exception as e:
             app.logger.error(f"Traffic thread error: {e}")
         time.sleep(10)
@@ -1894,7 +1913,31 @@ def logout():
 @login_required
 def dashboard():
     users = get_vpn_users()
-    return render_template('dashboard.html', users=users, panel_path=PANEL_PATH, prefix=USER_PREFIX)
+
+    total_sent = 0
+    total_received = 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT SUM(bytes_sent), SUM(bytes_received) FROM users")
+        row = c.fetchone()
+        if row:
+            total_sent = row[0] or 0
+            total_received = row[1] or 0
+        conn.close()
+    except:
+        pass
+
+    summary = {
+        'total_sent': format_bytes(total_sent),
+        'total_received': format_bytes(total_received),
+        'total_all': format_bytes(total_sent + total_received),
+        'active_count': sum(1 for u in users if u['online']),
+        'user_count': len(users),
+        'last_update': LAST_LOG_PROCESS
+    }
+
+    return render_template('dashboard.html', users=users, summary=summary, panel_path=PANEL_PATH, prefix=USER_PREFIX)
 
 @app.route(f'/{PANEL_PATH}/add_user', methods=['POST'])
 @login_required
@@ -2042,7 +2085,7 @@ EOF
         .form-control { background-color: #2c2c2c; border-color: #444; color: #fff; }
         .form-control:focus { background-color: #333; color: #fff; border-color: #0d6efd; box-shadow: none; }
         .btn-primary { background-color: #0d6efd; border: none; }
-        .form-label { color: #ccc; }
+        .form-label { color: #ffffff !important; }
     </style>
 </head>
 <body>
@@ -2085,10 +2128,10 @@ EOF
         body { background-color: #121212; color: #e0e0e0; }
         .navbar { background-color: #1e1e1e; border-bottom: 1px solid #333; }
         .card { background-color: #1e1e1e; border: 1px solid #333; margin-bottom: 20px; }
-        .card h5 { color: #ffffff; font-weight: bold; }
-        .form-label { color: #ffffff; font-weight: 500; }
+        .card h5 { color: #ffffff !important; font-weight: bold; }
+        .form-label { color: #ffffff !important; font-weight: 500; }
         .table { color: #e0e0e0; }
-        .table thead th { border-bottom: 2px solid #333; color: #fff; background-color: #2c2c2c; }
+        .table thead th { border-bottom: 2px solid #333; color: #ffffff !important; background-color: #2c2c2c; }
         .table td { border-bottom: 1px solid #222; }
         .form-control { background-color: #2c2c2c; border-color: #444; color: #fff; }
         .form-control:focus { background-color: #333; color: #fff; border-color: #0d6efd; box-shadow: none; }
@@ -2111,7 +2154,8 @@ EOF
     <nav class="navbar navbar-expand-lg navbar-dark mb-4">
         <div class="container">
             <a class="navbar-brand" href="#">مدیریت کاربران Slipstream</a>
-            <div class="ms-auto">
+            <div class="ms-auto d-flex align-items-center gap-3">
+                <span class="text-light small">بروزرسانی: {{ summary.last_update }}</span>
                 <a href="{{ url_for('logout') }}" class="btn btn-outline-danger btn-sm">خروج</a>
             </div>
         </div>
@@ -2127,6 +2171,30 @@ EOF
             {% endfor %}
           {% endif %}
         {% endwith %}
+        <div class="row mb-4">
+            <div class="col-md-12">
+                <div class="card p-3">
+                    <div class="row text-center">
+                        <div class="col-md-3 border-start">
+                            <div class="text-light small">کل مصرف سیستم</div>
+                            <div class="h4 mb-0 text-info" dir="ltr">{{ summary.total_all }}</div>
+                        </div>
+                        <div class="col-md-3 border-start">
+                            <div class="text-light small">کل دانلود (↑)</div>
+                            <div class="h4 mb-0 text-white" dir="ltr">{{ summary.total_sent }}</div>
+                        </div>
+                        <div class="col-md-3 border-start">
+                            <div class="text-light small">کل آپلود (↓)</div>
+                            <div class="h4 mb-0 text-white" dir="ltr">{{ summary.total_received }}</div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="text-light small">کاربران آنلاین</div>
+                            <div class="h4 mb-0 text-success">{{ summary.active_count }} / {{ summary.user_count }}</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
         <div class="row">
             <div class="col-md-4">
                 <div class="card p-4">
@@ -2171,11 +2239,13 @@ EOF
                             <tbody>
                                 {% for user in users %}
                                 <tr>
-                                    <td class="align-middle" dir="ltr">
-                                        {% if user.online %}
-                                            <span class="online-pulse" title="آنلاین"></span>
-                                        {% endif %}
-                                        {{ user.username }}
+                                    <td class="align-middle text-end">
+                                        <div dir="ltr" class="d-inline-block">
+                                            {{ user.username }}
+                                            {% if user.online %}
+                                                <span class="online-pulse" title="آنلاین" style="margin-left: 5px;"></span>
+                                            {% endif %}
+                                        </div>
                                     </td>
                                     <td class="align-middle">
                                         {% if user.enabled %}
@@ -2198,9 +2268,9 @@ EOF
                                     </td>
                                     <td class="align-middle">
                                         <div class="usage-text mb-1">
-                                            ↑ {{ user.sent }}<br>
-                                            ↓ {{ user.received }}<br>
-                                            <strong>Σ {{ user.total }}</strong>
+                                            <span class="text-white">↑ {{ user.sent }}</span><br>
+                                            <span class="text-white">↓ {{ user.received }}</span><br>
+                                            <strong class="text-info">Σ {{ user.total }}</strong>
                                         </div>
                                         <form action="{{ url_for('reset_usage', username=user.username) }}" method="POST" onsubmit="return confirm('حجم مصرفی ریست شود؟');">
                                             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
