@@ -1739,43 +1739,42 @@ def get_vpn_users():
         db_users = {u['username']: u for u in c.fetchall()}
         conn.close()
 
-        result = subprocess.run(['getent', 'group', VPN_GROUP], capture_output=True, text=True)
+        # Get all system users and filter by prefix
+        result = subprocess.run(['getent', 'passwd'], capture_output=True, text=True)
         if result.returncode == 0 and result.stdout:
-            parts = result.stdout.strip().split(':')
-            if len(parts) >= 4 and parts[3]:
-                user_list = parts[3].split(',')
-                for u in user_list:
-                    if u.startswith(USER_PREFIX):
-                        status_res = subprocess.run(['passwd', '-S', u], capture_output=True, text=True)
-                        is_enabled = True
-                        if status_res.returncode == 0:
-                            status_info = status_res.stdout.split()
-                            if len(status_info) >= 2 and status_info[1] == 'L':
-                                is_enabled = False
+            for line in result.stdout.splitlines():
+                u = line.split(':')[0]
+                if u.startswith(USER_PREFIX):
+                    status_res = subprocess.run(['passwd', '-S', u], capture_output=True, text=True)
+                    is_enabled = True
+                    if status_res.returncode == 0:
+                        status_info = status_res.stdout.split()
+                        if len(status_info) >= 2 and status_info[1] == 'L':
+                            is_enabled = False
 
-                        db_info = db_users.get(u, {})
-                        expiry_str = db_info.get('expiry_date', 'N/A')
-                        remaining = "N/A"
-                        if expiry_str != 'N/A':
-                            try:
-                                expiry_dt = datetime.strptime(expiry_str, '%Y-%m-%d %H:%M:%S')
-                                diff = expiry_dt - datetime.utcnow()
-                                remaining = max(0, diff.days)
-                            except:
-                                remaining = "Error"
+                    db_info = db_users.get(u, {})
+                    expiry_str = db_info.get('expiry_date') or 'N/A'
+                    remaining = "N/A"
+                    if expiry_str != 'N/A':
+                        try:
+                            expiry_dt = datetime.strptime(expiry_str, '%Y-%m-%d %H:%M:%S')
+                            diff = expiry_dt - datetime.utcnow()
+                            remaining = max(0, diff.days + (1 if diff.seconds > 0 else 0))
+                        except:
+                            remaining = "Error"
 
-                        sent = db_info.get('bytes_sent', 0)
-                        received = db_info.get('bytes_received', 0)
+                    sent = db_info.get('bytes_sent', 0)
+                    received = db_info.get('bytes_received', 0)
 
-                        users.append({
-                            'username': u,
-                            'enabled': is_enabled,
-                            'expiry': expiry_str,
-                            'remaining': remaining,
-                            'sent': format_bytes(sent),
-                            'received': format_bytes(received),
-                            'total': format_bytes(sent + received)
-                        })
+                    users.append({
+                        'username': u,
+                        'enabled': is_enabled,
+                        'expiry': expiry_str,
+                        'remaining': remaining,
+                        'sent': format_bytes(sent),
+                        'received': format_bytes(received),
+                        'total': format_bytes(sent + received)
+                    })
     except Exception as e:
         app.logger.error(f"Error getting users: {e}")
     return sorted(users, key=lambda x: x['username'])
@@ -1801,9 +1800,12 @@ def update_traffic_from_logs():
                         conn = sqlite3.connect(DB_PATH)
                         c = conn.cursor()
                         for line in lines:
-                            match = re.search(r'user "([^"]+)", (\d+) bytes uploaded, (\d+) bytes downloaded', line)
+                            # Use a more flexible regex to handle potential variations in spacing or formatting
+                            match = re.search(r'user\s+"([^"]+)",\s+(\d+)\s+bytes\s+uploaded,\s+(\d+)\s+bytes\s+downloaded', line)
                             if match:
                                 username, uploaded, downloaded = match.groups()
+                                # Ensure user exists in DB before updating
+                                c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
                                 c.execute("UPDATE users SET bytes_sent = bytes_sent + ?, bytes_received = bytes_received + ? WHERE username = ?",
                                           (int(uploaded), int(downloaded), username))
                         conn.commit()
@@ -1905,6 +1907,8 @@ def edit_user(username):
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
+        # Use INSERT OR IGNORE then UPDATE to handle users missing from DB
+        c.execute("INSERT OR IGNORE INTO users (username, expiry_date) VALUES (?, ?)", (username, expiry_date))
         c.execute("UPDATE users SET expiry_date = ? WHERE username = ?", (expiry_date, username))
         conn.commit()
         conn.close()
@@ -2122,7 +2126,9 @@ EOF
                                     </td>
                                     <td class="align-middle">
                                         <div class="d-flex flex-column align-items-center">
-                                            <span class="badge bg-primary mb-1">{{ user.remaining }} روز</span>
+                                            <span class="badge bg-primary mb-1">
+                                                {% if user.remaining == 'N/A' %}نامشخص{% else %}{{ user.remaining }} روز{% endif %}
+                                            </span>
                                             <form action="{{ url_for('edit_user', username=user.username) }}" method="POST" class="d-flex gap-1">
                                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                                 <input type="number" name="days" class="form-control form-control-sm" style="width: 60px;" placeholder="جدید" required>
@@ -2213,7 +2219,7 @@ setup_panel() {
 
     # Ensure log file exists and is accessible
     touch /var/log/danted.log
-    chmod 644 /var/log/danted.log
+    chmod 666 /var/log/danted.log
 
     # Create virtual environment and install requirements
     if [ ! -d "$PANEL_DIR/venv" ]; then
