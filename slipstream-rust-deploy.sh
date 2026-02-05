@@ -1610,6 +1610,7 @@ setup_dante() {
     # Configure Dante
     cat > /etc/danted.conf << EOF
 # Dante SOCKS server configuration
+logoutput: syslog
 logoutput: /var/log/danted.log
 user.privileged: root
 user.unprivileged: nobody
@@ -1622,9 +1623,6 @@ external: $external_interface
 
 # Authentication method
 socksmethod: $socks_method
-
-# Session tracking
-session.state.key: user
 EOF
 
     cat >> /etc/danted.conf << EOF
@@ -1836,9 +1834,9 @@ def update_traffic_from_logs():
                                 username = user_match.group(1)
                                 if username.startswith(USER_PREFIX):
                                     # 2. Check for connection status
-                                    if 'tcp/connect' in line or 'connect' in line and 'pass' in line:
+                                    if 'connect' in line.lower() and ('pass' in line.lower() or 'accepted' in line.lower()):
                                         ONLINE_SESSIONS[username] = ONLINE_SESSIONS.get(username, 0) + 1
-                                    elif 'tcp/disconnect' in line or 'disconnect' in line:
+                                    elif 'disconnect' in line.lower():
                                         ONLINE_SESSIONS[username] = max(0, ONLINE_SESSIONS.get(username, 0) - 1)
 
                                         # 3. Extract traffic on disconnect
