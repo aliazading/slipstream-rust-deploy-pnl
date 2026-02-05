@@ -86,7 +86,7 @@ else
     rm -rf "$temp_dir"
 
     clone_success=false
-    branches_to_try=("fix/panel-installation" "feature/user-management-panel-4891438396886854186" "$GITHUB_BRANCH" "master")
+    branches_to_try=("$GITHUB_BRANCH" "master" "fix/panel-installation" "feature/user-management-panel-4891438396886854186")
 
     for branch in "${branches_to_try[@]}"; do
         print_status "Trying branch: $branch"

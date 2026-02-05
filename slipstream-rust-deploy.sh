@@ -1697,6 +1697,7 @@ client pass {
 }
 
 # SOCKS rules - allow SOCKS requests to anywhere
+cat >> /etc/danted.conf << EOF
 socks pass {
     from: 127.0.0.0/8 to: 0.0.0.0/0
     command: bind connect udpassociate
@@ -1944,7 +1945,7 @@ setup_panel() {
 
         # Try to clone with specified branch, fallback to feature branch if needed
         local clone_success=false
-        local branches_to_try=("fix/panel-installation" "feature/user-management-panel-4891438396886854186" "$GITHUB_BRANCH" "master")
+        local branches_to_try=("$GITHUB_BRANCH" "master" "fix/panel-installation" "feature/user-management-panel-4891438396886854186")
 
         for branch in "${branches_to_try[@]}"; do
             print_status "Trying to download panel files from branch: $branch"
