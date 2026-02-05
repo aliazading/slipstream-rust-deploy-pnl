@@ -1605,7 +1605,8 @@ setup_dante() {
 
     # Ensure log file exists for Dante
     touch /var/log/danted.log
-    chmod 666 /var/log/danted.log
+    chmod 640 /var/log/danted.log
+    chown root:root /var/log/danted.log
 
     # Configure Dante
     cat > /etc/danted.conf << EOF
@@ -1690,7 +1691,7 @@ import sqlite3
 import time
 import threading
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, redirect, url_for, flash, session
 from functools import wraps
 from flask_wtf.csrf import CSRFProtect
@@ -1718,6 +1719,8 @@ def init_db():
                   expiry_date TIMESTAMP,
                   bytes_sent INTEGER DEFAULT 0,
                   bytes_received INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS settings
+                 (key TEXT PRIMARY KEY, value TEXT)''')
     conn.commit()
     conn.close()
 
@@ -1812,14 +1815,77 @@ def get_vpn_users():
 
 def update_traffic_from_logs():
     global ONLINE_SESSIONS
-    # Start from 0 to catch historical traffic and currently online users on startup
-    last_offset = 0
+    # 1. Get saved offset from DB
+    saved_offset = 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT value FROM settings WHERE key='last_log_offset'")
+        row = c.fetchone()
+        if row:
+            saved_offset = int(row[0])
+        conn.close()
+    except:
+        pass
 
+    last_offset = 0 # Current position in the scan
+
+    # 2. Re-process log from start to rebuild ONLINE_SESSIONS
+    # but only update DB traffic if line is after saved_offset
+    if os.path.exists(DANTE_LOG):
+        try:
+            with open(DANTE_LOG, 'r', errors='replace') as f:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                while True:
+                    current_line_pos = f.tell()
+                    line = f.readline()
+                    if not line:
+                        break
+
+                    user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_-]+)', line, re.IGNORECASE)
+                    if user_match:
+                        username = user_match.group(1)
+                    else:
+                        ss_match = re.search(r'(?:^|[^a-zA-Z0-9_-])(ss_[a-zA-Z0-9_-]+)', line)
+                        if ss_match:
+                            username = ss_match.group(1)
+                        else:
+                            continue
+                    if not username.startswith(USER_PREFIX):
+                        continue
+
+                    line_lower = line.lower()
+                    if 'connect' in line_lower and ('pass' in line_lower or 'accepted' in line_lower):
+                        ONLINE_SESSIONS[username] = ONLINE_SESSIONS.get(username, 0) + 1
+                    elif 'disconnect' in line_lower:
+                        ONLINE_SESSIONS[username] = max(0, ONLINE_SESSIONS.get(username, 0) - 1)
+
+                        # Only update DB if we haven't processed this line before
+                        if current_line_pos >= saved_offset:
+                            up, down = 0, 0
+                            traffic_parts = re.findall(r'(\d+)\s+bytes?\s+(\w+)', line_lower)
+                            for val, label in traffic_parts:
+                                if label in ['uploaded', 'in', 'received']: up = int(val)
+                                elif label in ['downloaded', 'out', 'sent']: down = int(val)
+
+                            if up > 0 or down > 0:
+                                c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
+                                c.execute("UPDATE users SET bytes_sent = bytes_sent + ?, bytes_received = bytes_received + ? WHERE username = ?", (down, up, username))
+
+                last_offset = f.tell()
+                c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_log_offset', ?)", (str(last_offset),))
+                conn.commit()
+                conn.close()
+        except Exception as e:
+            app.logger.error(f"Initial log scan error: {e}")
+
+    # 3. Enter monitoring loop
     while True:
         try:
             if os.path.exists(DANTE_LOG):
                 current_size = os.path.getsize(DANTE_LOG)
-                if current_size < last_offset:
+                if current_size < last_offset: # Log rotation detected
                     last_offset = 0
 
                 if current_size > last_offset:
@@ -1828,48 +1894,41 @@ def update_traffic_from_logs():
                         conn = sqlite3.connect(DB_PATH)
                         c = conn.cursor()
                         for line in f:
-                            # 1. Look for user in the line - handles "user ss_name" or "user: ss_name"
-                            user_match = re.search(r'user\s*[:\s]\s*(\S+)', line, re.IGNORECASE)
-                            if not user_match:
-                                continue
-
-                            username = user_match.group(1).strip('"\':,')
-                            if not username.startswith(USER_PREFIX):
-                                continue
+                            user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_-]+)', line, re.IGNORECASE)
+                            if user_match:
+                                username = user_match.group(1)
+                            else:
+                                # Fallback: look for ss_ prefix directly
+                                ss_match = re.search(r'(?:^|[^a-zA-Z0-9_-])(ss_[a-zA-Z0-9_-]+)', line)
+                                if ss_match:
+                                    username = ss_match.group(1)
+                                else:
+                                    continue
+                            if not username.startswith(USER_PREFIX): continue
 
                             line_lower = line.lower()
-                            # 2. Check for connection status
                             if 'connect' in line_lower and ('pass' in line_lower or 'accepted' in line_lower):
                                 ONLINE_SESSIONS[username] = ONLINE_SESSIONS.get(username, 0) + 1
                             elif 'disconnect' in line_lower:
                                 ONLINE_SESSIONS[username] = max(0, ONLINE_SESSIONS.get(username, 0) - 1)
-
-                                # 3. Extract traffic on disconnect
-                                # Dante usually logs: X bytes uploaded, Y bytes downloaded
-                                # Or: X bytes in, Y bytes out
-                                up = 0
-                                down = 0
+                                up, down = 0, 0
                                 traffic_parts = re.findall(r'(\d+)\s+bytes?\s+(\w+)', line_lower)
                                 for val, label in traffic_parts:
-                                    if label in ['uploaded', 'sent', 'out', 'in']:
-                                        # Map Dante labels to direction
-                                        # 'uploaded' or 'in' (from client to server)
-                                        # 'downloaded' or 'out' (from server to client)
-                                        if label in ['uploaded', 'in']:
-                                            up = int(val)
-                                        else:
-                                            down = int(val)
-
+                                    if label in ['uploaded', 'in', 'received']: up = int(val)
+                                    elif label in ['downloaded', 'out', 'sent']: down = int(val)
                                 if up > 0 or down > 0:
                                     c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
-                                    c.execute("UPDATE users SET bytes_sent = bytes_sent + ?, bytes_received = bytes_received + ? WHERE username = ?",
-                                              (down, up, username))
+                                    c.execute("UPDATE users SET bytes_sent = bytes_sent + ?, bytes_received = bytes_received + ? WHERE username = ?", (down, up, username))
+
+                        last_offset = f.tell()
+                        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_log_offset', ?)", (str(last_offset),))
                         conn.commit()
                         conn.close()
-                    last_offset = current_size
 
                 global LAST_LOG_PROCESS
-                LAST_LOG_PROCESS = datetime.now().strftime('%H:%M:%S')
+                # Use Tehran time (UTC+3:30)
+                tehran_now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
+                LAST_LOG_PROCESS = tehran_now.strftime('%H:%M:%S')
         except Exception as e:
             app.logger.error(f"Traffic thread error: {e}")
         time.sleep(10)
@@ -2155,7 +2214,7 @@ EOF
         <div class="container">
             <a class="navbar-brand" href="#">مدیریت کاربران Slipstream</a>
             <div class="ms-auto d-flex align-items-center gap-3">
-                <span class="text-light small">بروزرسانی: {{ summary.last_update }}</span>
+                <span class="text-white small">بروزرسانی: {{ summary.last_update }}</span>
                 <a href="{{ url_for('logout') }}" class="btn btn-outline-danger btn-sm">خروج</a>
             </div>
         </div>
@@ -2176,20 +2235,20 @@ EOF
                 <div class="card p-3">
                     <div class="row text-center">
                         <div class="col-md-3 border-start">
-                            <div class="text-light small">کل مصرف سیستم</div>
+                            <div class="text-white small mb-1">کل مصرف سیستم</div>
                             <div class="h4 mb-0 text-info" dir="ltr">{{ summary.total_all }}</div>
                         </div>
                         <div class="col-md-3 border-start">
-                            <div class="text-light small">کل دانلود (↑)</div>
+                            <div class="text-white small mb-1">کل دانلود (↓)</div>
                             <div class="h4 mb-0 text-white" dir="ltr">{{ summary.total_sent }}</div>
                         </div>
                         <div class="col-md-3 border-start">
-                            <div class="text-light small">کل آپلود (↓)</div>
+                            <div class="text-white small mb-1">کل آپلود (↑)</div>
                             <div class="h4 mb-0 text-white" dir="ltr">{{ summary.total_received }}</div>
                         </div>
                         <div class="col-md-3">
-                            <div class="text-light small">کاربران آنلاین</div>
-                            <div class="h4 mb-0 text-success">{{ summary.active_count }} / {{ summary.user_count }}</div>
+                            <div class="text-white small mb-1">کاربران آنلاین</div>
+                            <div class="h4 mb-0 text-success" dir="ltr">{{ summary.active_count }} / {{ summary.user_count }}</div>
                         </div>
                     </div>
                 </div>
@@ -2268,8 +2327,8 @@ EOF
                                     </td>
                                     <td class="align-middle">
                                         <div class="usage-text mb-1">
-                                            <span class="text-white">↑ {{ user.sent }}</span><br>
-                                            <span class="text-white">↓ {{ user.received }}</span><br>
+                                            <span class="text-white">↑ {{ user.received }}</span><br>
+                                            <span class="text-white">↓ {{ user.sent }}</span><br>
                                             <strong class="text-info">Σ {{ user.total }}</strong>
                                         </div>
                                         <form action="{{ url_for('reset_usage', username=user.username) }}" method="POST" onsubmit="return confirm('حجم مصرفی ریست شود؟');">
@@ -2346,6 +2405,11 @@ setup_panel() {
     # Create panel directory and files
     mkdir -p "$PANEL_DIR"
     create_panel_files
+
+    # Ensure log file exists for Dante monitoring before panel starts
+    touch /var/log/danted.log
+    chmod 640 /var/log/danted.log
+    chown root:root /var/log/danted.log
 
     # Create virtual environment and install requirements
     if [ ! -d "$PANEL_DIR/venv" ]; then
