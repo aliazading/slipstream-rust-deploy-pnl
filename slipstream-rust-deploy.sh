@@ -1622,6 +1622,9 @@ external: $external_interface
 
 # Authentication method
 socksmethod: $socks_method
+
+# Session tracking
+session.state.key: user
 EOF
 
     cat >> /etc/danted.conf << EOF
@@ -1706,6 +1709,7 @@ VPN_GROUP = "slipstream-users"
 USER_PREFIX = "ss_"
 DB_PATH = os.path.join(os.path.dirname(__file__), 'panel.db')
 DANTE_LOG = "/var/log/danted.log"
+ONLINE_SESSIONS = {} # {username: count}
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -1797,9 +1801,10 @@ def get_vpn_users():
                 'enabled': is_enabled,
                 'expiry': expiry_str,
                 'remaining': remaining,
-                'sent': format_bytes(sent),
-                'received': format_bytes(received),
-                'total': format_bytes(sent + received)
+                'sent': format_bytes(sent), # Download (from server perspective)
+                'received': format_bytes(received), # Upload (to server perspective)
+                'total': format_bytes(sent + received),
+                'online': ONLINE_SESSIONS.get(u, 0) > 0
             })
         except:
             continue
@@ -1807,6 +1812,7 @@ def get_vpn_users():
     return sorted(users, key=lambda x: x['username'])
 
 def update_traffic_from_logs():
+    global ONLINE_SESSIONS
     last_offset = 0
     if os.path.exists(DANTE_LOG):
         last_offset = os.path.getsize(DANTE_LOG)
@@ -1824,14 +1830,26 @@ def update_traffic_from_logs():
                         conn = sqlite3.connect(DB_PATH)
                         c = conn.cursor()
                         for line in f:
-                            # Robust regex for different Dante versions and formats
-                            match = re.search(r'user\s+["\']?([^"\'\s,:]+)["\']?.*?\s+(\d+)\s+bytes?\s+(?:uploaded|sent|out).*?(\d+)\s+bytes?\s+(?:downloaded|received|in)', line, re.IGNORECASE)
-                            if match:
-                                username, uploaded, downloaded = match.groups()
+                            # 1. Look for user in the line
+                            user_match = re.search(r'user\s+["\']?([^"\'\s,:@.]+)', line, re.IGNORECASE)
+                            if user_match:
+                                username = user_match.group(1)
                                 if username.startswith(USER_PREFIX):
-                                    c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
-                                    c.execute("UPDATE users SET bytes_sent = bytes_sent + ?, bytes_received = bytes_received + ? WHERE username = ?",
-                                              (int(uploaded), int(downloaded), username))
+                                    # 2. Check for connection status
+                                    if 'tcp/connect' in line or 'connect' in line and 'pass' in line:
+                                        ONLINE_SESSIONS[username] = ONLINE_SESSIONS.get(username, 0) + 1
+                                    elif 'tcp/disconnect' in line or 'disconnect' in line:
+                                        ONLINE_SESSIONS[username] = max(0, ONLINE_SESSIONS.get(username, 0) - 1)
+
+                                        # 3. Extract traffic on disconnect
+                                        traffic_match = re.search(r'(\d+)\s+bytes?\s+(?:uploaded|received|in).*?(\d+)\s+bytes?\s+(?:downloaded|sent|out)', line, re.IGNORECASE)
+                                        if traffic_match:
+                                            uploaded, downloaded = traffic_match.groups()
+                                            c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
+                                            # bytes_received = uploaded (from client)
+                                            # bytes_sent = downloaded (to client)
+                                            c.execute("UPDATE users SET bytes_sent = bytes_sent + ?, bytes_received = bytes_received + ? WHERE username = ?",
+                                                      (int(downloaded), int(uploaded), username))
                         conn.commit()
                         conn.close()
                     last_offset = current_size
@@ -2077,6 +2095,18 @@ EOF
         .form-control { background-color: #2c2c2c; border-color: #444; color: #fff; }
         .form-control:focus { background-color: #333; color: #fff; border-color: #0d6efd; box-shadow: none; }
         .usage-text { font-size: 0.8rem; line-height: 1.2; }
+        .online-pulse {
+            width: 10px; height: 10px; background-color: #2ecc71; border-radius: 50%;
+            display: inline-block; margin-right: 8px;
+            box-shadow: 0 0 0 rgba(46, 204, 113, 0.4);
+            animation: pulse 2s infinite;
+            vertical-align: middle;
+        }
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(46, 204, 113, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(46, 204, 113, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(46, 204, 113, 0); }
+        }
     </style>
 </head>
 <body>
@@ -2143,7 +2173,12 @@ EOF
                             <tbody>
                                 {% for user in users %}
                                 <tr>
-                                    <td class="align-middle" dir="ltr">{{ user.username }}</td>
+                                    <td class="align-middle" dir="ltr">
+                                        {% if user.online %}
+                                            <span class="online-pulse" title="آنلاین"></span>
+                                        {% endif %}
+                                        {{ user.username }}
+                                    </td>
                                     <td class="align-middle">
                                         {% if user.enabled %}
                                             <span class="badge bg-success">فعال</span>
