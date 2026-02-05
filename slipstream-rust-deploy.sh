@@ -1731,52 +1731,75 @@ def login_required(f):
 
 def get_vpn_users():
     users = []
+    db_users = {}
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         c.execute("SELECT * FROM users")
-        db_users = {u['username']: u for u in c.fetchall()}
+        for row in c.fetchall():
+            db_users[row['username']] = dict(row)
         conn.close()
-
-        # Get all system users and filter by prefix
-        result = subprocess.run(['getent', 'passwd'], capture_output=True, text=True)
-        if result.returncode == 0 and result.stdout:
-            for line in result.stdout.splitlines():
-                u = line.split(':')[0]
-                if u.startswith(USER_PREFIX):
-                    status_res = subprocess.run(['passwd', '-S', u], capture_output=True, text=True)
-                    is_enabled = True
-                    if status_res.returncode == 0:
-                        status_info = status_res.stdout.split()
-                        if len(status_info) >= 2 and status_info[1] == 'L':
-                            is_enabled = False
-
-                    db_info = db_users.get(u, {})
-                    expiry_str = db_info.get('expiry_date') or 'N/A'
-                    remaining = "N/A"
-                    if expiry_str != 'N/A':
-                        try:
-                            expiry_dt = datetime.strptime(expiry_str, '%Y-%m-%d %H:%M:%S')
-                            diff = expiry_dt - datetime.utcnow()
-                            remaining = max(0, diff.days + (1 if diff.seconds > 0 else 0))
-                        except:
-                            remaining = "Error"
-
-                    sent = db_info.get('bytes_sent', 0)
-                    received = db_info.get('bytes_received', 0)
-
-                    users.append({
-                        'username': u,
-                        'enabled': is_enabled,
-                        'expiry': expiry_str,
-                        'remaining': remaining,
-                        'sent': format_bytes(sent),
-                        'received': format_bytes(received),
-                        'total': format_bytes(sent + received)
-                    })
     except Exception as e:
-        app.logger.error(f"Error getting users: {e}")
+        app.logger.error(f"DB Error: {e}")
+
+    system_users = set()
+    try:
+        # Source 1: /etc/passwd
+        if os.path.exists('/etc/passwd'):
+            with open('/etc/passwd', 'r') as f:
+                for line in f:
+                    u = line.split(':')[0]
+                    if u.startswith(USER_PREFIX):
+                        system_users.add(u)
+
+        # Source 2: getent group
+        res = subprocess.run(['getent', 'group', VPN_GROUP], capture_output=True, text=True, timeout=5)
+        if res.returncode == 0 and res.stdout:
+            parts = res.stdout.strip().split(':')
+            if len(parts) >= 4 and parts[3]:
+                for u in parts[3].split(','):
+                    u = u.strip()
+                    if u.startswith(USER_PREFIX):
+                        system_users.add(u)
+    except Exception as e:
+        app.logger.error(f"User discovery error: {e}")
+
+    for u in system_users:
+        try:
+            status_res = subprocess.run(['passwd', '-S', u], capture_output=True, text=True, timeout=5)
+            is_enabled = True
+            if status_res.returncode == 0:
+                status_info = status_res.stdout.split()
+                if len(status_info) >= 2 and status_info[1] == 'L':
+                    is_enabled = False
+
+            db_info = db_users.get(u, {})
+            expiry_str = db_info.get('expiry_date') or 'N/A'
+            remaining = "N/A"
+            if expiry_str != 'N/A':
+                try:
+                    expiry_dt = datetime.strptime(expiry_str, '%Y-%m-%d %H:%M:%S')
+                    diff = expiry_dt - datetime.utcnow()
+                    remaining = max(0, diff.days + (1 if diff.seconds > 0 else 0))
+                except:
+                    remaining = "Error"
+
+            sent = db_info.get('bytes_sent', 0)
+            received = db_info.get('bytes_received', 0)
+
+            users.append({
+                'username': u,
+                'enabled': is_enabled,
+                'expiry': expiry_str,
+                'remaining': remaining,
+                'sent': format_bytes(sent),
+                'received': format_bytes(received),
+                'total': format_bytes(sent + received)
+            })
+        except:
+            continue
+
     return sorted(users, key=lambda x: x['username'])
 
 def update_traffic_from_logs():
@@ -1800,14 +1823,14 @@ def update_traffic_from_logs():
                         conn = sqlite3.connect(DB_PATH)
                         c = conn.cursor()
                         for line in lines:
-                            # Use a more flexible regex to handle potential variations in spacing or formatting
-                            match = re.search(r'user\s+"([^"]+)",\s+(\d+)\s+bytes\s+uploaded,\s+(\d+)\s+bytes\s+downloaded', line)
+                            # More flexible regex to handle Dante's log format variants
+                            match = re.search(r'user\s+([^,:\s]+)[,:]\s+(\d+)\s+bytes\s+uploaded,\s+(\d+)\s+bytes\s+downloaded', line)
                             if match:
                                 username, uploaded, downloaded = match.groups()
-                                # Ensure user exists in DB before updating
-                                c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
-                                c.execute("UPDATE users SET bytes_sent = bytes_sent + ?, bytes_received = bytes_received + ? WHERE username = ?",
-                                          (int(uploaded), int(downloaded), username))
+                                if username.startswith(USER_PREFIX):
+                                    c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
+                                    c.execute("UPDATE users SET bytes_sent = bytes_sent + ?, bytes_received = bytes_received + ? WHERE username = ?",
+                                              (int(uploaded), int(downloaded), username))
                         conn.commit()
                         conn.close()
         except Exception as e:
@@ -1991,6 +2014,7 @@ EOF
 <html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ورود به پنل مدیریت</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.rtl.min.css">
@@ -2035,6 +2059,7 @@ EOF
 <html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>پنل مدیریت کاربران</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.rtl.min.css">
@@ -2042,8 +2067,8 @@ EOF
         body { background-color: #121212; color: #e0e0e0; }
         .navbar { background-color: #1e1e1e; border-bottom: 1px solid #333; }
         .card { background-color: #1e1e1e; border: 1px solid #333; margin-bottom: 20px; }
-        .card h5 { color: #fff; }
-        .form-label { color: #ccc; }
+        .card h5 { color: #ffffff; font-weight: bold; }
+        .form-label { color: #ffffff; font-weight: 500; }
         .table { color: #e0e0e0; }
         .table thead th { border-bottom: 2px solid #333; color: #fff; background-color: #2c2c2c; }
         .table td { border-bottom: 1px solid #222; }
