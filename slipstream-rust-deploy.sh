@@ -1603,10 +1603,16 @@ setup_dante() {
         print_status "Password set successfully for SOCKS user"
     fi
 
+    # Ensure log file exists for Dante
+    touch /var/log/danted.log
+    chmod 640 /var/log/danted.log
+    chown root:root /var/log/danted.log
+
     # Configure Dante
     cat > /etc/danted.conf << EOF
 # Dante SOCKS server configuration
 logoutput: syslog
+logoutput: /var/log/danted.log
 user.privileged: root
 user.unprivileged: nobody
 
@@ -1638,14 +1644,14 @@ socks pass {
     command: bind connect udpassociate
 EOF
 
-    if [[ -n "$passwd_file" ]]; then
+    if [[ "$socks_method" == "username" ]]; then
         cat >> /etc/danted.conf << EOF
     method: username
 EOF
     fi
 
     cat >> /etc/danted.conf << EOF
-    log: error
+    log: connect disconnect error
 }
 
 # Block IPv6 if not properly configured
@@ -1681,6 +1687,11 @@ create_panel_files() {
     cat > "$PANEL_DIR/app.py" << 'EOF'
 import os
 import subprocess
+import sqlite3
+import time
+import threading
+import re
+from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, redirect, url_for, flash, session
 from functools import wraps
 from flask_wtf.csrf import CSRFProtect
@@ -1695,6 +1706,30 @@ ADMIN_PASS = os.environ.get('ADMIN_PASS', 'admin')
 PANEL_PATH = os.environ.get('PANEL_PATH', 'panel').strip('/')
 VPN_GROUP = "slipstream-users"
 USER_PREFIX = "ss_"
+DB_PATH = os.path.join(os.path.dirname(__file__), 'panel.db')
+DANTE_LOG = "/var/log/danted.log"
+ONLINE_SESSIONS = {} # {username: count}
+LAST_LOG_PROCESS = "هرگز"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (username TEXT PRIMARY KEY,
+                  expiry_date TIMESTAMP,
+                  bytes_sent INTEGER DEFAULT 0,
+                  bytes_received INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS settings
+                 (key TEXT PRIMARY KEY, value TEXT)''')
+    conn.commit()
+    conn.close()
+
+def format_bytes(size):
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024.0:
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} PB"
 
 def login_required(f):
     @wraps(f)
@@ -1706,26 +1741,215 @@ def login_required(f):
 
 def get_vpn_users():
     users = []
+    db_users = {}
     try:
-        # Get users in the specific group
-        result = subprocess.run(['getent', 'group', VPN_GROUP], capture_output=True, text=True)
-        if result.returncode == 0 and result.stdout:
-            parts = result.stdout.strip().split(':')
-            if len(parts) >= 4 and parts[3]:
-                user_list = parts[3].split(',')
-                for u in user_list:
-                    if u.startswith(USER_PREFIX):
-                        # Check if user is locked
-                        status_res = subprocess.run(['passwd', '-S', u], capture_output=True, text=True)
-                        is_enabled = True
-                        if status_res.returncode == 0:
-                            status_info = status_res.stdout.split()
-                            if len(status_info) >= 2 and status_info[1] == 'L':
-                                is_enabled = False
-                        users.append({'username': u, 'enabled': is_enabled})
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM users")
+        for row in c.fetchall():
+            db_users[row['username']] = dict(row)
+        conn.close()
     except Exception as e:
-        app.logger.error(f"Error getting users: {e}")
+        app.logger.error(f"DB Error: {e}")
+
+    system_users = set()
+    try:
+        # Source 1: /etc/passwd
+        if os.path.exists('/etc/passwd'):
+            with open('/etc/passwd', 'r') as f:
+                for line in f:
+                    u = line.split(':')[0]
+                    if u.startswith(USER_PREFIX):
+                        system_users.add(u)
+
+        # Source 2: getent group
+        res = subprocess.run(['getent', 'group', VPN_GROUP], capture_output=True, text=True, timeout=5)
+        if res.returncode == 0 and res.stdout:
+            parts = res.stdout.strip().split(':')
+            if len(parts) >= 4 and parts[3]:
+                for u in parts[3].split(','):
+                    u = u.strip()
+                    if u.startswith(USER_PREFIX):
+                        system_users.add(u)
+    except Exception as e:
+        app.logger.error(f"User discovery error: {e}")
+
+    for u in system_users:
+        try:
+            status_res = subprocess.run(['passwd', '-S', u], capture_output=True, text=True, timeout=5)
+            is_enabled = True
+            if status_res.returncode == 0:
+                status_info = status_res.stdout.split()
+                if len(status_info) >= 2 and status_info[1] == 'L':
+                    is_enabled = False
+
+            db_info = db_users.get(u, {})
+            expiry_str = db_info.get('expiry_date') or 'N/A'
+            remaining = "N/A"
+            if expiry_str != 'N/A':
+                try:
+                    expiry_dt = datetime.strptime(expiry_str, '%Y-%m-%d %H:%M:%S')
+                    diff = expiry_dt - datetime.utcnow()
+                    remaining = max(0, diff.days + (1 if diff.seconds > 0 else 0))
+                except:
+                    remaining = "Error"
+
+            sent = db_info.get('bytes_sent', 0)
+            received = db_info.get('bytes_received', 0)
+
+            users.append({
+                'username': u,
+                'enabled': is_enabled,
+                'expiry': expiry_str,
+                'remaining': remaining,
+                'sent': format_bytes(sent), # Download (from server perspective)
+                'received': format_bytes(received), # Upload (to server perspective)
+                'total': format_bytes(sent + received),
+                'online': ONLINE_SESSIONS.get(u, 0) > 0
+            })
+        except:
+            continue
+
     return sorted(users, key=lambda x: x['username'])
+
+def update_traffic_from_logs():
+    global ONLINE_SESSIONS
+    # 1. Get saved offset from DB
+    saved_offset = 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT value FROM settings WHERE key='last_log_offset'")
+        row = c.fetchone()
+        if row:
+            saved_offset = int(row[0])
+        conn.close()
+    except:
+        pass
+
+    last_offset = 0 # Current position in the scan
+
+    # 2. Re-process log from start to rebuild ONLINE_SESSIONS
+    # but only update DB traffic if line is after saved_offset
+    if os.path.exists(DANTE_LOG):
+        try:
+            with open(DANTE_LOG, 'r', errors='replace') as f:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                while True:
+                    current_line_pos = f.tell()
+                    line = f.readline()
+                    if not line:
+                        break
+
+                    user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_-]+)', line, re.IGNORECASE)
+                    if user_match:
+                        username = user_match.group(1)
+                    else:
+                        ss_match = re.search(r'(?:^|[^a-zA-Z0-9_-])(ss_[a-zA-Z0-9_-]+)', line)
+                        if ss_match:
+                            username = ss_match.group(1)
+                        else:
+                            continue
+                    if not username.startswith(USER_PREFIX):
+                        continue
+
+                    line_lower = line.lower()
+                    if 'connect' in line_lower and ('pass' in line_lower or 'accepted' in line_lower):
+                        ONLINE_SESSIONS[username] = ONLINE_SESSIONS.get(username, 0) + 1
+                    elif 'disconnect' in line_lower:
+                        ONLINE_SESSIONS[username] = max(0, ONLINE_SESSIONS.get(username, 0) - 1)
+
+                        # Only update DB if we haven't processed this line before
+                        if current_line_pos >= saved_offset:
+                            up, down = 0, 0
+                            traffic_parts = re.findall(r'(\d+)\s+bytes?\s+(\w+)', line_lower)
+                            for val, label in traffic_parts:
+                                if label in ['uploaded', 'in', 'received']: up = int(val)
+                                elif label in ['downloaded', 'out', 'sent']: down = int(val)
+
+                            if up > 0 or down > 0:
+                                c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
+                                c.execute("UPDATE users SET bytes_sent = bytes_sent + ?, bytes_received = bytes_received + ? WHERE username = ?", (down, up, username))
+
+                last_offset = f.tell()
+                c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_log_offset', ?)", (str(last_offset),))
+                conn.commit()
+                conn.close()
+        except Exception as e:
+            app.logger.error(f"Initial log scan error: {e}")
+
+    # 3. Enter monitoring loop
+    while True:
+        try:
+            if os.path.exists(DANTE_LOG):
+                current_size = os.path.getsize(DANTE_LOG)
+                if current_size < last_offset: # Log rotation detected
+                    last_offset = 0
+
+                if current_size > last_offset:
+                    with open(DANTE_LOG, 'r', errors='replace') as f:
+                        f.seek(last_offset)
+                        conn = sqlite3.connect(DB_PATH)
+                        c = conn.cursor()
+                        for line in f:
+                            user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_-]+)', line, re.IGNORECASE)
+                            if user_match:
+                                username = user_match.group(1)
+                            else:
+                                # Fallback: look for ss_ prefix directly
+                                ss_match = re.search(r'(?:^|[^a-zA-Z0-9_-])(ss_[a-zA-Z0-9_-]+)', line)
+                                if ss_match:
+                                    username = ss_match.group(1)
+                                else:
+                                    continue
+                            if not username.startswith(USER_PREFIX): continue
+
+                            line_lower = line.lower()
+                            if 'connect' in line_lower and ('pass' in line_lower or 'accepted' in line_lower):
+                                ONLINE_SESSIONS[username] = ONLINE_SESSIONS.get(username, 0) + 1
+                            elif 'disconnect' in line_lower:
+                                ONLINE_SESSIONS[username] = max(0, ONLINE_SESSIONS.get(username, 0) - 1)
+                                up, down = 0, 0
+                                traffic_parts = re.findall(r'(\d+)\s+bytes?\s+(\w+)', line_lower)
+                                for val, label in traffic_parts:
+                                    if label in ['uploaded', 'in', 'received']: up = int(val)
+                                    elif label in ['downloaded', 'out', 'sent']: down = int(val)
+                                if up > 0 or down > 0:
+                                    c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
+                                    c.execute("UPDATE users SET bytes_sent = bytes_sent + ?, bytes_received = bytes_received + ? WHERE username = ?", (down, up, username))
+
+                        last_offset = f.tell()
+                        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_log_offset', ?)", (str(last_offset),))
+                        conn.commit()
+                        conn.close()
+
+                global LAST_LOG_PROCESS
+                # Use Tehran time (UTC+3:30)
+                tehran_now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
+                LAST_LOG_PROCESS = tehran_now.strftime('%H:%M:%S')
+        except Exception as e:
+            app.logger.error(f"Traffic thread error: {e}")
+        time.sleep(10)
+
+def check_expirations():
+    while True:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT username FROM users WHERE expiry_date < datetime('now')")
+            expired_users = c.fetchall()
+            for (username,) in expired_users:
+                status_res = subprocess.run(['passwd', '-S', username], capture_output=True, text=True)
+                if status_res.returncode == 0:
+                    status_info = status_res.stdout.split()
+                    if len(status_info) >= 2 and status_info[1] != 'L':
+                        subprocess.run(['usermod', '-L', username])
+            conn.close()
+        except Exception as e:
+            pass
+        time.sleep(60)
 
 @app.route(f'/{PANEL_PATH}/login', methods=['GET', 'POST'])
 def login():
@@ -1748,17 +1972,45 @@ def logout():
 @login_required
 def dashboard():
     users = get_vpn_users()
-    return render_template('dashboard.html', users=users, panel_path=PANEL_PATH, prefix=USER_PREFIX)
+
+    total_sent = 0
+    total_received = 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT SUM(bytes_sent), SUM(bytes_received) FROM users")
+        row = c.fetchone()
+        if row:
+            total_sent = row[0] or 0
+            total_received = row[1] or 0
+        conn.close()
+    except:
+        pass
+
+    summary = {
+        'total_sent': format_bytes(total_sent),
+        'total_received': format_bytes(total_received),
+        'total_all': format_bytes(total_sent + total_received),
+        'active_count': sum(1 for u in users if u['online']),
+        'user_count': len(users),
+        'last_update': LAST_LOG_PROCESS
+    }
+
+    return render_template('dashboard.html', users=users, summary=summary, panel_path=PANEL_PATH, prefix=USER_PREFIX)
 
 @app.route(f'/{PANEL_PATH}/add_user', methods=['POST'])
 @login_required
 def add_user():
     username = request.form.get('username')
     password = request.form.get('password')
+    days = request.form.get('days', '30')
 
     if not username or not password:
         flash('نام کاربری و رمز عبور الزامی است', 'warning')
         return redirect(url_for('dashboard'))
+
+    if not days.isdigit():
+        days = '30'
 
     if not username.startswith(USER_PREFIX):
         username = USER_PREFIX + username
@@ -1773,10 +2025,54 @@ def add_user():
         process = subprocess.Popen(['chpasswd'], stdin=subprocess.PIPE, text=True)
         process.communicate(input=f'{username}:{password}')
 
+        expiry_date = (datetime.utcnow() + timedelta(days=int(days))).strftime('%Y-%m-%d %H:%M:%S')
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO users (username, expiry_date) VALUES (?, ?)", (username, expiry_date))
+        conn.commit()
+        conn.close()
+
         flash(f'کاربر {username} با موفقیت ساخته شد', 'success')
     except Exception as e:
         flash(f'خطا در ساخت کاربر: {str(e)}', 'danger')
 
+    return redirect(url_for('dashboard'))
+
+@app.route(f'/{PANEL_PATH}/edit_user/<username>', methods=['POST'])
+@login_required
+def edit_user(username):
+    days = request.form.get('days')
+    if not days or not days.isdigit():
+        flash('تعداد روز معتبر نیست', 'warning')
+        return redirect(url_for('dashboard'))
+
+    expiry_date = (datetime.utcnow() + timedelta(days=int(days))).strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        # Use INSERT OR IGNORE then UPDATE to handle users missing from DB
+        c.execute("INSERT OR IGNORE INTO users (username, expiry_date) VALUES (?, ?)", (username, expiry_date))
+        c.execute("UPDATE users SET expiry_date = ? WHERE username = ?", (expiry_date, username))
+        conn.commit()
+        conn.close()
+        subprocess.run(['usermod', '-U', username])
+        flash(f'اعتبار کاربر {username} به {days} روز تغییر یافت', 'success')
+    except Exception as e:
+        flash(f'خطا: {str(e)}', 'danger')
+    return redirect(url_for('dashboard'))
+
+@app.route(f'/{PANEL_PATH}/reset_usage/<username>', methods=['POST'])
+@login_required
+def reset_usage(username):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE users SET bytes_sent = 0, bytes_received = 0 WHERE username = ?", (username,))
+        conn.commit()
+        conn.close()
+        flash(f'حجم مصرفی کاربر {username} صفر شد', 'success')
+    except Exception as e:
+        flash(f'خطا: {str(e)}', 'danger')
     return redirect(url_for('dashboard'))
 
 @app.route(f'/{PANEL_PATH}/toggle_user/<username>', methods=['POST'])
@@ -1814,6 +2110,11 @@ def delete_user(username):
 
     try:
         subprocess.run(['userdel', username], check=True)
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM users WHERE username = ?", (username,))
+        conn.commit()
+        conn.close()
         flash(f'کاربر {username} با موفقیت حذف شد', 'success')
     except Exception as e:
         flash(f'خطا در حذف کاربر: {str(e)}', 'danger')
@@ -1821,6 +2122,9 @@ def delete_user(username):
     return redirect(url_for('dashboard'))
 
 if __name__ == '__main__':
+    init_db()
+    threading.Thread(target=update_traffic_from_logs, daemon=True).start()
+    threading.Thread(target=check_expirations, daemon=True).start()
     port = int(os.environ.get('PANEL_PORT', 17066))
     app.run(host='0.0.0.0', port=port)
 EOF
@@ -1830,6 +2134,7 @@ EOF
 <html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ورود به پنل مدیریت</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.rtl.min.css">
@@ -1839,6 +2144,7 @@ EOF
         .form-control { background-color: #2c2c2c; border-color: #444; color: #fff; }
         .form-control:focus { background-color: #333; color: #fff; border-color: #0d6efd; box-shadow: none; }
         .btn-primary { background-color: #0d6efd; border: none; }
+        .form-label { color: #ffffff !important; }
     </style>
 </head>
 <body>
@@ -1873,6 +2179,7 @@ EOF
 <html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>پنل مدیریت کاربران</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.rtl.min.css">
@@ -1880,18 +2187,34 @@ EOF
         body { background-color: #121212; color: #e0e0e0; }
         .navbar { background-color: #1e1e1e; border-bottom: 1px solid #333; }
         .card { background-color: #1e1e1e; border: 1px solid #333; margin-bottom: 20px; }
+        .card h5 { color: #ffffff !important; font-weight: bold; }
+        .form-label { color: #ffffff !important; font-weight: 500; }
         .table { color: #e0e0e0; }
-        .table thead th { border-bottom: 2px solid #333; color: #fff; background-color: #2c2c2c; }
+        .table thead th { border-bottom: 2px solid #333; color: #ffffff !important; background-color: #2c2c2c; }
         .table td { border-bottom: 1px solid #222; }
         .form-control { background-color: #2c2c2c; border-color: #444; color: #fff; }
         .form-control:focus { background-color: #333; color: #fff; border-color: #0d6efd; box-shadow: none; }
+        .usage-text { font-size: 0.8rem; line-height: 1.2; }
+        .online-pulse {
+            width: 10px; height: 10px; background-color: #2ecc71; border-radius: 50%;
+            display: inline-block; margin-right: 8px;
+            box-shadow: 0 0 0 rgba(46, 204, 113, 0.4);
+            animation: pulse 2s infinite;
+            vertical-align: middle;
+        }
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(46, 204, 113, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(46, 204, 113, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(46, 204, 113, 0); }
+        }
     </style>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark mb-4">
         <div class="container">
             <a class="navbar-brand" href="#">مدیریت کاربران Slipstream</a>
-            <div class="ms-auto">
+            <div class="ms-auto d-flex align-items-center gap-3">
+                <span class="text-white small">بروزرسانی: {{ summary.last_update }}</span>
                 <a href="{{ url_for('logout') }}" class="btn btn-outline-danger btn-sm">خروج</a>
             </div>
         </div>
@@ -1907,6 +2230,30 @@ EOF
             {% endfor %}
           {% endif %}
         {% endwith %}
+        <div class="row mb-4">
+            <div class="col-md-12">
+                <div class="card p-3">
+                    <div class="row text-center">
+                        <div class="col-md-3 border-start">
+                            <div class="text-white small mb-1">کل مصرف سیستم</div>
+                            <div class="h4 mb-0 text-info" dir="ltr">{{ summary.total_all }}</div>
+                        </div>
+                        <div class="col-md-3 border-start">
+                            <div class="text-white small mb-1">کل دانلود (↓)</div>
+                            <div class="h4 mb-0 text-white" dir="ltr">{{ summary.total_sent }}</div>
+                        </div>
+                        <div class="col-md-3 border-start">
+                            <div class="text-white small mb-1">کل آپلود (↑)</div>
+                            <div class="h4 mb-0 text-white" dir="ltr">{{ summary.total_received }}</div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="text-white small mb-1">کاربران آنلاین</div>
+                            <div class="h4 mb-0 text-success" dir="ltr">{{ summary.active_count }} / {{ summary.user_count }}</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
         <div class="row">
             <div class="col-md-4">
                 <div class="card p-4">
@@ -1925,6 +2272,10 @@ EOF
                             <label for="password" class="form-label">رمز عبور</label>
                             <input type="password" name="password" class="form-control" id="password" required>
                         </div>
+                        <div class="mb-3">
+                            <label for="days" class="form-label">تعداد روزهای اعتبار</label>
+                            <input type="number" name="days" class="form-control" id="days" value="30" min="1" required>
+                        </div>
                         <button type="submit" class="btn btn-success w-100">افزودن</button>
                     </form>
                 </div>
@@ -1939,13 +2290,22 @@ EOF
                                 <tr>
                                     <th>نام کاربری</th>
                                     <th>وضعیت</th>
+                                    <th>اعتبار (روز)</th>
+                                    <th>مصرف حجم</th>
                                     <th>عملیات</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 {% for user in users %}
                                 <tr>
-                                    <td class="align-middle" dir="ltr">{{ user.username }}</td>
+                                    <td class="align-middle text-end">
+                                        <div dir="ltr" class="d-inline-block">
+                                            {{ user.username }}
+                                            {% if user.online %}
+                                                <span class="online-pulse" title="آنلاین" style="margin-left: 5px;"></span>
+                                            {% endif %}
+                                        </div>
+                                    </td>
                                     <td class="align-middle">
                                         {% if user.enabled %}
                                             <span class="badge bg-success">فعال</span>
@@ -1953,25 +2313,48 @@ EOF
                                             <span class="badge bg-danger">غیرفعال</span>
                                         {% endif %}
                                     </td>
-                                    <td>
-                                        <div class="d-flex gap-2">
+                                    <td class="align-middle">
+                                        <div class="d-flex flex-column align-items-center">
+                                            <span class="badge bg-primary mb-1">
+                                                {% if user.remaining == 'N/A' %}نامشخص{% else %}{{ user.remaining }} روز{% endif %}
+                                            </span>
+                                            <form action="{{ url_for('edit_user', username=user.username) }}" method="POST" class="d-flex gap-1">
+                                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                                <input type="number" name="days" class="form-control form-control-sm" style="width: 60px;" placeholder="جدید" required>
+                                                <button type="submit" class="btn btn-outline-info btn-sm" title="تغییر اعتبار">✓</button>
+                                            </form>
+                                        </div>
+                                    </td>
+                                    <td class="align-middle">
+                                        <div class="usage-text mb-1">
+                                            <span class="text-white">↑ {{ user.received }}</span><br>
+                                            <span class="text-white">↓ {{ user.sent }}</span><br>
+                                            <strong class="text-info">Σ {{ user.total }}</strong>
+                                        </div>
+                                        <form action="{{ url_for('reset_usage', username=user.username) }}" method="POST" onsubmit="return confirm('حجم مصرفی ریست شود؟');">
+                                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                            <button type="submit" class="btn btn-outline-secondary btn-sm" style="font-size: 0.7rem;">ریست حجم</button>
+                                        </form>
+                                    </td>
+                                    <td class="align-middle">
+                                        <div class="d-flex flex-column gap-2">
                                             <form action="{{ url_for('toggle_user', username=user.username) }}" method="POST">
                                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                                 {% if user.enabled %}
-                                                    <button type="submit" class="btn btn-warning btn-sm">غیرفعال‌سازی</button>
+                                                    <button type="submit" class="btn btn-warning btn-sm w-100">غیرفعال‌سازی</button>
                                                 {% else %}
-                                                    <button type="submit" class="btn btn-info btn-sm text-white">فعال‌سازی</button>
+                                                    <button type="submit" class="btn btn-info btn-sm text-white w-100">فعال‌سازی</button>
                                                 {% endif %}
                                             </form>
                                             <form action="{{ url_for('delete_user', username=user.username) }}" method="POST" onsubmit="return confirm('آیا از حذف این کاربر اطمینان دارید؟');">
                                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                                <button type="submit" class="btn btn-danger btn-sm">حذف</button>
+                                                <button type="submit" class="btn btn-danger btn-sm w-100">حذف</button>
                                             </form>
                                         </div>
                                     </td>
                                 </tr>
                                 {% else %}
-                                <tr><td colspan="3" class="text-center">کاربری یافت نشد</td></tr>
+                                <tr><td colspan="5" class="text-center">کاربری یافت نشد</td></tr>
                                 {% endfor %}
                             </tbody>
                         </table>
@@ -2004,10 +2387,10 @@ setup_panel() {
     # Install Python dependencies
     case $PKG_MANAGER in
         dnf|yum)
-            $PKG_MANAGER install -y python3 python3-pip
+            $PKG_MANAGER install -y python3 python3-pip sqlite
             ;;
         apt)
-            apt install -y python3 python3-pip python3-venv
+            apt install -y python3 python3-pip python3-venv sqlite3
             ;;
     esac
 
@@ -2022,6 +2405,11 @@ setup_panel() {
     # Create panel directory and files
     mkdir -p "$PANEL_DIR"
     create_panel_files
+
+    # Ensure log file exists for Dante monitoring before panel starts
+    touch /var/log/danted.log
+    chmod 640 /var/log/danted.log
+    chown root:root /var/log/danted.log
 
     # Create virtual environment and install requirements
     if [ ! -d "$PANEL_DIR/venv" ]; then
