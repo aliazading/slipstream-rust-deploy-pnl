@@ -1729,7 +1729,15 @@ def init_db():
                  (username TEXT PRIMARY KEY,
                   expiry_date TIMESTAMP,
                   bytes_sent INTEGER DEFAULT 0,
-                  bytes_received INTEGER DEFAULT 0)''')
+                  bytes_received INTEGER DEFAULT 0,
+                  traffic_limit INTEGER DEFAULT 107374182400)''')
+
+    # Migration for existing DB
+    c.execute("PRAGMA table_info(users)")
+    columns = [col[1] for col in c.fetchall()]
+    if 'traffic_limit' not in columns:
+        c.execute("ALTER TABLE users ADD COLUMN traffic_limit INTEGER DEFAULT 107374182400")
+
     c.execute('''CREATE TABLE IF NOT EXISTS settings
                  (key TEXT PRIMARY KEY, value TEXT)''')
     conn.commit()
@@ -1808,15 +1816,22 @@ def get_vpn_users():
 
             sent = db_info.get('bytes_sent', 0)
             received = db_info.get('bytes_received', 0)
+            traffic_limit = db_info.get('traffic_limit', 107374182400)
+            total_bytes = sent + received
+            over_limit = total_bytes >= traffic_limit if traffic_limit > 0 else False
 
             users.append({
                 'username': u,
                 'enabled': is_enabled,
                 'expiry': expiry_str,
                 'remaining': remaining,
-                'sent': format_bytes(sent), # Download (from server perspective)
-                'received': format_bytes(received), # Upload (to server perspective)
-                'total': format_bytes(sent + received),
+                'sent': format_bytes(sent),
+                'received': format_bytes(received),
+                'total': format_bytes(total_bytes),
+                'total_raw': total_bytes,
+                'limit': format_bytes(traffic_limit),
+                'limit_raw': traffic_limit,
+                'over_limit': over_limit,
                 'online': ONLINE_SESSIONS.get(u, 0) > 0
             })
         except:
@@ -1974,14 +1989,18 @@ def check_expirations():
         try:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
+            # 1. Check date expirations
             c.execute("SELECT username FROM users WHERE expiry_date < datetime('now')")
             expired_users = c.fetchall()
             for (username,) in expired_users:
-                status_res = subprocess.run(['passwd', '-S', username], capture_output=True, text=True)
-                if status_res.returncode == 0:
-                    status_info = status_res.stdout.split()
-                    if len(status_info) >= 2 and status_info[1] != 'L':
-                        subprocess.run(['usermod', '-L', username])
+                subprocess.run(['usermod', '-L', username], capture_output=True)
+
+            # 2. Check traffic limits
+            c.execute("SELECT username FROM users WHERE bytes_sent + bytes_received >= traffic_limit AND traffic_limit > 0")
+            overlimit_users = c.fetchall()
+            for (username,) in overlimit_users:
+                subprocess.run(['usermod', '-L', username], capture_output=True)
+
             conn.close()
         except Exception as e:
             pass
@@ -2040,13 +2059,14 @@ def add_user():
     username = request.form.get('username')
     password = request.form.get('password')
     days = request.form.get('days', '30')
+    limit_gb = request.form.get('limit_gb', '100')
 
     if not username or not password:
         flash('نام کاربری و رمز عبور الزامی است', 'warning')
         return redirect(url_for('dashboard'))
 
-    if not days.isdigit():
-        days = '30'
+    if not days.isdigit(): days = '30'
+    if not limit_gb.isdigit(): limit_gb = '100'
 
     if not username.startswith(USER_PREFIX):
         username = USER_PREFIX + username
@@ -2062,9 +2082,10 @@ def add_user():
         process.communicate(input=f'{username}:{password}')
 
         expiry_date = (datetime.utcnow() + timedelta(days=int(days))).strftime('%Y-%m-%d %H:%M:%S')
+        limit_bytes = int(limit_gb) * 1024 * 1024 * 1024
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO users (username, expiry_date) VALUES (?, ?)", (username, expiry_date))
+        c.execute("INSERT OR REPLACE INTO users (username, expiry_date, traffic_limit) VALUES (?, ?, ?)", (username, expiry_date, limit_bytes))
         conn.commit()
         conn.close()
 
@@ -2074,41 +2095,12 @@ def add_user():
 
     return redirect(url_for('dashboard'))
 
-@app.route(f'/{PANEL_PATH}/edit_user/<username>', methods=['POST'])
+@app.route(f'/{PANEL_PATH}/reset_online', methods=['POST'])
 @login_required
-def edit_user(username):
-    days = request.form.get('days')
-    if not days or not days.isdigit():
-        flash('تعداد روز معتبر نیست', 'warning')
-        return redirect(url_for('dashboard'))
-
-    expiry_date = (datetime.utcnow() + timedelta(days=int(days))).strftime('%Y-%m-%d %H:%M:%S')
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        # Use INSERT OR IGNORE then UPDATE to handle users missing from DB
-        c.execute("INSERT OR IGNORE INTO users (username, expiry_date) VALUES (?, ?)", (username, expiry_date))
-        c.execute("UPDATE users SET expiry_date = ? WHERE username = ?", (expiry_date, username))
-        conn.commit()
-        conn.close()
-        subprocess.run(['usermod', '-U', username])
-        flash(f'اعتبار کاربر {username} به {days} روز تغییر یافت', 'success')
-    except Exception as e:
-        flash(f'خطا: {str(e)}', 'danger')
-    return redirect(url_for('dashboard'))
-
-@app.route(f'/{PANEL_PATH}/reset_usage/<username>', methods=['POST'])
-@login_required
-def reset_usage(username):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("UPDATE users SET bytes_sent = 0, bytes_received = 0 WHERE username = ?", (username,))
-        conn.commit()
-        conn.close()
-        flash(f'حجم مصرفی کاربر {username} صفر شد', 'success')
-    except Exception as e:
-        flash(f'خطا: {str(e)}', 'danger')
+def reset_online():
+    global ONLINE_SESSIONS
+    ONLINE_SESSIONS = {}
+    flash('وضعیت آنلاین تمام کاربران ریست شد', 'info')
     return redirect(url_for('dashboard'))
 
 @app.route(f'/{PANEL_PATH}/toggle_user/<username>', methods=['POST'])
@@ -2135,6 +2127,56 @@ def toggle_user(username):
     except Exception as e:
         flash(f'خطا: {str(e)}', 'danger')
 
+    return redirect(url_for('dashboard'))
+
+@app.route(f'/{PANEL_PATH}/reset_usage/<username>', methods=['POST'])
+@login_required
+def reset_usage(username):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE users SET bytes_sent = 0, bytes_received = 0 WHERE username = ?", (username,))
+        conn.commit()
+        conn.close()
+        # Also unlock the user if they were locked due to traffic
+        subprocess.run(['usermod', '-U', username], capture_output=True)
+        flash(f'حجم مصرفی کاربر {username} صفر شد', 'success')
+    except Exception as e:
+        flash(f'خطا: {str(e)}', 'danger')
+    return redirect(url_for('dashboard'))
+
+@app.route(f'/{PANEL_PATH}/edit_user/<username>', methods=['POST'])
+@login_required
+def edit_user(username):
+    password = request.form.get('password')
+    limit_gb = request.form.get('limit_gb')
+    days = request.form.get('days')
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+
+        if password:
+            process = subprocess.Popen(['chpasswd'], stdin=subprocess.PIPE, text=True)
+            process.communicate(input=f'{username}:{password}')
+
+        if limit_gb and limit_gb.isdigit():
+            limit_bytes = int(limit_gb) * 1024 * 1024 * 1024
+            c.execute("UPDATE users SET traffic_limit = ? WHERE username = ?", (limit_bytes, username))
+
+        if days and days.isdigit():
+            new_expiry = (datetime.utcnow() + timedelta(days=int(days))).strftime('%Y-%m-%d %H:%M:%S')
+            c.execute("UPDATE users SET expiry_date = ? WHERE username = ?", (new_expiry, username))
+
+        conn.commit()
+        conn.close()
+
+        # Unlock user if they are being updated
+        subprocess.run(['usermod', '-U', username], capture_output=True)
+
+        flash(f'کاربر {username} با موفقیت بروزرسانی شد', 'success')
+    except Exception as e:
+        flash(f'خطا: {str(e)}', 'danger')
     return redirect(url_for('dashboard'))
 
 @app.route(f'/{PANEL_PATH}/delete_user/<username>', methods=['POST'])
@@ -2181,6 +2223,7 @@ EOF
         .form-control:focus { background-color: #333; color: #fff; border-color: #0d6efd; box-shadow: none; }
         .btn-primary { background-color: #0d6efd; border: none; }
         .form-label { color: #ffffff !important; }
+        .btn-xs { padding: 1px 5px; font-size: 0.75rem; border-radius: 3px; }
     </style>
 </head>
 <body>
@@ -2285,6 +2328,10 @@ EOF
                         <div class="col-md-3">
                             <div class="text-white small mb-1">کاربران آنلاین</div>
                             <div class="h4 mb-0 text-success" dir="ltr">{{ summary.active_count }} / {{ summary.user_count }}</div>
+                            <form action="{{ url_for('reset_online') }}" method="POST" class="mt-1">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button type="submit" class="btn btn-outline-warning btn-xs" style="font-size: 0.6rem;">ریست وضعیت آنلاین</button>
+                            </form>
                         </div>
                     </div>
                 </div>
@@ -2311,6 +2358,10 @@ EOF
                         <div class="mb-3">
                             <label for="days" class="form-label">تعداد روزهای اعتبار</label>
                             <input type="number" name="days" class="form-control" id="days" value="30" min="1" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="limit_gb" class="form-label">محدودیت حجم (GB)</label>
+                            <input type="number" name="limit_gb" class="form-control" id="limit_gb" value="100" min="1" required>
                         </div>
                         <button type="submit" class="btn btn-success w-100">افزودن</button>
                     </form>
@@ -2343,10 +2394,12 @@ EOF
                                         </div>
                                     </td>
                                     <td class="align-middle">
-                                        {% if user.enabled %}
+                                        {% if user.over_limit %}
+                                            <span class="badge bg-danger">پایان حجم</span>
+                                        {% elif user.enabled %}
                                             <span class="badge bg-success">فعال</span>
                                         {% else %}
-                                            <span class="badge bg-danger">غیرفعال</span>
+                                            <span class="badge bg-secondary">غیرفعال</span>
                                         {% endif %}
                                     </td>
                                     <td class="align-middle">
@@ -2363,13 +2416,13 @@ EOF
                                     </td>
                                     <td class="align-middle">
                                         <div class="usage-text mb-1">
-                                            <span class="text-white">↑ {{ user.received }}</span><br>
-                                            <span class="text-white">↓ {{ user.sent }}</span><br>
-                                            <strong class="text-info">Σ {{ user.total }}</strong>
+                                            <div class="d-flex justify-content-between small"><span class="text-muted">آپلود:</span><span class="text-white">{{ user.received }}</span></div>
+                                            <div class="d-flex justify-content-between small"><span class="text-muted">دانلود:</span><span class="text-white">{{ user.sent }}</span></div>
+                                            <div class="d-flex justify-content-between border-top mt-1 pt-1"><span class="text-muted small">کل/سقف:</span><strong class="text-info" style="font-size: 0.8rem;">{{ user.total }} / {{ user.limit }}</strong></div>
                                         </div>
                                         <form action="{{ url_for('reset_usage', username=user.username) }}" method="POST" onsubmit="return confirm('حجم مصرفی ریست شود؟');">
                                             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                            <button type="submit" class="btn btn-outline-secondary btn-sm" style="font-size: 0.7rem;">ریست حجم</button>
+                                            <button type="submit" class="btn btn-outline-secondary btn-xs py-0" style="font-size: 0.65rem;">ریست حجم</button>
                                         </form>
                                     </td>
                                     <td class="align-middle">
@@ -2382,10 +2435,43 @@ EOF
                                                     <button type="submit" class="btn btn-info btn-sm text-white w-100">فعال‌سازی</button>
                                                 {% endif %}
                                             </form>
+                                            <button type="button" class="btn btn-primary btn-sm w-100" data-bs-toggle="modal" data-bs-target="#editModal{{ user.username|replace('ss_', '') }}">ویرایش</button>
                                             <form action="{{ url_for('delete_user', username=user.username) }}" method="POST" onsubmit="return confirm('آیا از حذف این کاربر اطمینان دارید؟');">
                                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                                 <button type="submit" class="btn btn-danger btn-sm w-100">حذف</button>
                                             </form>
+                                        </div>
+                                        <!-- Edit Modal -->
+                                        <div class="modal fade" id="editModal{{ user.username|replace('ss_', '') }}" tabindex="-1" aria-hidden="true">
+                                          <div class="modal-dialog">
+                                            <div class="modal-content bg-dark text-white border-secondary text-end">
+                                              <div class="modal-header border-secondary">
+                                                <h5 class="modal-title">ویرایش کاربر {{ user.username }}</h5>
+                                                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                                              </div>
+                                              <form action="{{ url_for('edit_user', username=user.username) }}" method="POST">
+                                                <div class="modal-body">
+                                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                                    <div class="mb-3">
+                                                        <label class="form-label">رمز عبور جدید (خالی بگذارید اگر تغییر نمی‌کند)</label>
+                                                        <input type="password" name="password" class="form-control bg-dark text-white border-secondary">
+                                                    </div>
+                                                    <div class="mb-3">
+                                                        <label class="form-label">تمدید اعتبار (تعداد روز از الان)</label>
+                                                        <input type="number" name="days" class="form-control bg-dark text-white border-secondary" placeholder="مثلاً 30">
+                                                    </div>
+                                                    <div class="mb-3">
+                                                        <label class="form-label">محدودیت حجم جدید (GB)</label>
+                                                        <input type="number" name="limit_gb" class="form-control bg-dark text-white border-secondary" placeholder="{{ user.limit_raw // 1073741824 }}">
+                                                    </div>
+                                                </div>
+                                                <div class="modal-footer border-secondary">
+                                                  <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">انصراف</button>
+                                                  <button type="submit" class="btn btn-primary">ذخیره تغییرات</button>
+                                                </div>
+                                              </form>
+                                            </div>
+                                          </div>
                                         </div>
                                     </td>
                                 </tr>
