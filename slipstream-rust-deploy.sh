@@ -1605,8 +1605,19 @@ setup_dante() {
 
     # Ensure log file exists for Dante
     touch /var/log/danted.log
-    chmod 640 /var/log/danted.log
-    chown root:root /var/log/danted.log
+    chmod 660 /var/log/danted.log
+    chown nobody:nogroup /var/log/danted.log 2>/dev/null || chown nobody:nobody /var/log/danted.log
+
+    # Fix for Dante logging on systems with strict systemd sandbox (like Ubuntu)
+    if [[ -d /lib/systemd/system ]]; then
+        print_status "Applying Dante logging fix for systemd..."
+        mkdir -p /etc/systemd/system/danted.service.d
+        cat > /etc/systemd/system/danted.service.d/override.conf << EOF
+[Service]
+ReadWritePaths=/var/log/danted.log
+EOF
+        systemctl daemon-reload 2>/dev/null || true
+    fi
 
     # Configure Dante
     cat > /etc/danted.conf << EOF
@@ -1843,31 +1854,44 @@ def update_traffic_from_logs():
                     if not line:
                         break
 
-                    user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_-]+)', line, re.IGNORECASE)
+                    username = None
+                    user_match = re.search(r'username%([a-zA-Z0-9_-]+)', line)
                     if user_match:
                         username = user_match.group(1)
                     else:
-                        ss_match = re.search(r'(?:^|[^a-zA-Z0-9_-])(ss_[a-zA-Z0-9_-]+)', line)
-                        if ss_match:
-                            username = ss_match.group(1)
+                        user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_-]+)', line, re.IGNORECASE)
+                        if user_match:
+                            username = user_match.group(1)
                         else:
-                            continue
+                            ss_match = re.search(r'(?:^|[^a-zA-Z0-9_-])(ss_[a-zA-Z0-9_-]+)', line)
+                            if ss_match:
+                                username = ss_match.group(1)
+                            else:
+                                continue
                     if not username.startswith(USER_PREFIX):
                         continue
 
-                    line_lower = line.lower()
-                    if 'connect' in line_lower and ('pass' in line_lower or 'accepted' in line_lower):
+                    is_connect = '[:' in line or ('connect' in line.lower() and ('pass' in line.lower() or 'accepted' in line.lower()) and ']:' not in line)
+                    is_disconnect = ']:' in line or 'disconnect' in line.lower()
+
+                    if is_connect:
                         ONLINE_SESSIONS[username] = ONLINE_SESSIONS.get(username, 0) + 1
-                    elif 'disconnect' in line_lower:
+                    elif is_disconnect:
                         ONLINE_SESSIONS[username] = max(0, ONLINE_SESSIONS.get(username, 0) - 1)
 
                         # Only update DB if we haven't processed this line before
                         if current_line_pos >= saved_offset:
                             up, down = 0, 0
-                            traffic_parts = re.findall(r'(\d+)\s+bytes?\s+(\w+)', line_lower)
-                            for val, label in traffic_parts:
-                                if label in ['uploaded', 'in', 'received']: up = int(val)
-                                elif label in ['downloaded', 'out', 'sent']: down = int(val)
+                            # Try new format: (\d+) -> user@... -> (\d+)
+                            traffic_match = re.search(r'(\d+)\s+->\s+username%'+re.escape(username)+r'@.*?\s+->\s+(\d+)', line)
+                            if traffic_match:
+                                up = int(traffic_match.group(1))
+                                down = int(traffic_match.group(2))
+                            else:
+                                traffic_parts = re.findall(r'(\d+)\s+bytes?\s+(\w+)', line.lower())
+                                for val, label in traffic_parts:
+                                    if label in ['uploaded', 'in', 'received']: up = int(val)
+                                    elif label in ['downloaded', 'out', 'sent']: down = int(val)
 
                             if up > 0 or down > 0:
                                 c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
@@ -1894,28 +1918,40 @@ def update_traffic_from_logs():
                         conn = sqlite3.connect(DB_PATH)
                         c = conn.cursor()
                         for line in f:
-                            user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_-]+)', line, re.IGNORECASE)
+                            username = None
+                            user_match = re.search(r'username%([a-zA-Z0-9_-]+)', line)
                             if user_match:
                                 username = user_match.group(1)
                             else:
-                                # Fallback: look for ss_ prefix directly
-                                ss_match = re.search(r'(?:^|[^a-zA-Z0-9_-])(ss_[a-zA-Z0-9_-]+)', line)
-                                if ss_match:
-                                    username = ss_match.group(1)
+                                user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_-]+)', line, re.IGNORECASE)
+                                if user_match:
+                                    username = user_match.group(1)
                                 else:
-                                    continue
+                                    ss_match = re.search(r'(?:^|[^a-zA-Z0-9_-])(ss_[a-zA-Z0-9_-]+)', line)
+                                    if ss_match:
+                                        username = ss_match.group(1)
+                                    else:
+                                        continue
                             if not username.startswith(USER_PREFIX): continue
 
-                            line_lower = line.lower()
-                            if 'connect' in line_lower and ('pass' in line_lower or 'accepted' in line_lower):
+                            is_connect = '[:' in line or ('connect' in line.lower() and ('pass' in line.lower() or 'accepted' in line.lower()) and ']:' not in line)
+                            is_disconnect = ']:' in line or 'disconnect' in line.lower()
+
+                            if is_connect:
                                 ONLINE_SESSIONS[username] = ONLINE_SESSIONS.get(username, 0) + 1
-                            elif 'disconnect' in line_lower:
+                            elif is_disconnect:
                                 ONLINE_SESSIONS[username] = max(0, ONLINE_SESSIONS.get(username, 0) - 1)
                                 up, down = 0, 0
-                                traffic_parts = re.findall(r'(\d+)\s+bytes?\s+(\w+)', line_lower)
-                                for val, label in traffic_parts:
-                                    if label in ['uploaded', 'in', 'received']: up = int(val)
-                                    elif label in ['downloaded', 'out', 'sent']: down = int(val)
+                                # Try new format: (\d+) -> user@... -> (\d+)
+                                traffic_match = re.search(r'(\d+)\s+->\s+username%'+re.escape(username)+r'@.*?\s+->\s+(\d+)', line)
+                                if traffic_match:
+                                    up = int(traffic_match.group(1))
+                                    down = int(traffic_match.group(2))
+                                else:
+                                    traffic_parts = re.findall(r'(\d+)\s+bytes?\s+(\w+)', line.lower())
+                                    for val, label in traffic_parts:
+                                        if label in ['uploaded', 'in', 'received']: up = int(val)
+                                        elif label in ['downloaded', 'out', 'sent']: down = int(val)
                                 if up > 0 or down > 0:
                                     c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
                                     c.execute("UPDATE users SET bytes_sent = bytes_sent + ?, bytes_received = bytes_received + ? WHERE username = ?", (down, up, username))
