@@ -1870,20 +1870,28 @@ def update_traffic_from_logs():
                         break
 
                     username = None
-                    user_match = re.search(r'username%([a-zA-Z0-9_-]+)', line)
+                    user_match = re.search(r'username%([a-zA-Z0-9_@.-]+)', line)
                     if user_match:
                         username = user_match.group(1)
+                        if '@' in username:
+                            parts = username.split('@')
+                            if len(parts) > 1 and (parts[-1][0].isdigit() or '.' in parts[-1] or '[' in parts[-1]):
+                                username = '@'.join(parts[:-1])
                     else:
-                        user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_-]+)', line, re.IGNORECASE)
+                        user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_@.-]+)', line, re.IGNORECASE)
                         if user_match:
                             username = user_match.group(1)
                         else:
-                            ss_match = re.search(r'(?:^|[^a-zA-Z0-9_-])(ss_[a-zA-Z0-9_-]+)', line)
+                            ss_match = re.search(r'(?:^|[^a-zA-Z0-9_@.-])(ss_[a-zA-Z0-9_@.-]+)', line)
                             if ss_match:
                                 username = ss_match.group(1)
+                                if '@' in username:
+                                    parts = username.split('@')
+                                    if len(parts) > 1 and (parts[-1][0].isdigit() or '.' in parts[-1]):
+                                        username = '@'.join(parts[:-1])
                             else:
                                 continue
-                    if not username.startswith(USER_PREFIX):
+                    if not username or not username.startswith(USER_PREFIX):
                         continue
 
                     is_connect = '[:' in line or ('connect' in line.lower() and ('pass' in line.lower() or 'accepted' in line.lower()) and ']:' not in line)
@@ -1926,6 +1934,7 @@ def update_traffic_from_logs():
                 current_size = os.path.getsize(DANTE_LOG)
                 if current_size < last_offset: # Log rotation detected
                     last_offset = 0
+                    ONLINE_SESSIONS = {} # Clear sessions on rotation
 
                 if current_size > last_offset:
                     with open(DANTE_LOG, 'r', errors='replace') as f:
@@ -1934,20 +1943,28 @@ def update_traffic_from_logs():
                         c = conn.cursor()
                         for line in f:
                             username = None
-                            user_match = re.search(r'username%([a-zA-Z0-9_-]+)', line)
+                            user_match = re.search(r'username%([a-zA-Z0-9_@.-]+)', line)
                             if user_match:
                                 username = user_match.group(1)
+                                if '@' in username:
+                                    parts = username.split('@')
+                                    if len(parts) > 1 and (parts[-1][0].isdigit() or '.' in parts[-1] or '[' in parts[-1]):
+                                        username = '@'.join(parts[:-1])
                             else:
-                                user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_-]+)', line, re.IGNORECASE)
+                                user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_@.-]+)', line, re.IGNORECASE)
                                 if user_match:
                                     username = user_match.group(1)
                                 else:
-                                    ss_match = re.search(r'(?:^|[^a-zA-Z0-9_-])(ss_[a-zA-Z0-9_-]+)', line)
+                                    ss_match = re.search(r'(?:^|[^a-zA-Z0-9_@.-])(ss_[a-zA-Z0-9_@.-]+)', line)
                                     if ss_match:
                                         username = ss_match.group(1)
+                                        if '@' in username:
+                                            parts = username.split('@')
+                                            if len(parts) > 1 and (parts[-1][0].isdigit() or '.' in parts[-1]):
+                                                username = '@'.join(parts[:-1])
                                     else:
                                         continue
-                            if not username.startswith(USER_PREFIX): continue
+                            if not username or not username.startswith(USER_PREFIX): continue
 
                             is_connect = '[:' in line or ('connect' in line.lower() and ('pass' in line.lower() or 'accepted' in line.lower()) and ']:' not in line)
                             is_disconnect = ']:' in line or 'disconnect' in line.lower()
@@ -2435,14 +2452,14 @@ EOF
                                                     <button type="submit" class="btn btn-info btn-sm text-white w-100">فعال‌سازی</button>
                                                 {% endif %}
                                             </form>
-                                            <button type="button" class="btn btn-primary btn-sm w-100" data-bs-toggle="modal" data-bs-target="#editModal{{ user.username|replace('ss_', '') }}">ویرایش</button>
+                                            <button type="button" class="btn btn-primary btn-sm w-100" data-bs-toggle="modal" data-bs-target="#editModal{{ loop.index }}">ویرایش</button>
                                             <form action="{{ url_for('delete_user', username=user.username) }}" method="POST" onsubmit="return confirm('آیا از حذف این کاربر اطمینان دارید؟');">
                                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                                 <button type="submit" class="btn btn-danger btn-sm w-100">حذف</button>
                                             </form>
                                         </div>
                                         <!-- Edit Modal -->
-                                        <div class="modal fade" id="editModal{{ user.username|replace('ss_', '') }}" tabindex="-1" aria-hidden="true">
+                                        <div class="modal fade" id="editModal{{ loop.index }}" tabindex="-1" aria-hidden="true">
                                           <div class="modal-dialog">
                                             <div class="modal-content bg-dark text-white border-secondary text-end">
                                               <div class="modal-header border-secondary">
