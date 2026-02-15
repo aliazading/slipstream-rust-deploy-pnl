@@ -1719,7 +1719,7 @@ VPN_GROUP = "slipstream-users"
 USER_PREFIX = "ss_"
 DB_PATH = os.path.join(os.path.dirname(__file__), 'panel.db')
 DANTE_LOG = "/var/log/danted.log"
-ONLINE_SESSIONS = {} # {username: count}
+ONLINE_SESSIONS = {} # {username: {session_id: timestamp}}
 LAST_LOG_PROCESS = "هرگز"
 
 def init_db():
@@ -1832,7 +1832,7 @@ def get_vpn_users():
                 'limit': format_bytes(traffic_limit),
                 'limit_raw': traffic_limit,
                 'over_limit': over_limit,
-                'online': ONLINE_SESSIONS.get(u, 0) > 0
+                'online': len(ONLINE_SESSIONS.get(u, {})) > 0
             })
         except:
             continue
@@ -1870,13 +1870,19 @@ def update_traffic_from_logs():
                         break
 
                     username = None
+                    session_id = "default"
                     user_match = re.search(r'username%([a-zA-Z0-9_@.-]+)', line)
                     if user_match:
-                        username = user_match.group(1)
-                        if '@' in username:
-                            parts = username.split('@')
+                        full_u = user_match.group(1)
+                        if '@' in full_u:
+                            parts = full_u.split('@')
                             if len(parts) > 1 and (parts[-1][0].isdigit() or '.' in parts[-1] or '[' in parts[-1]):
+                                session_id = parts[-1]
                                 username = '@'.join(parts[:-1])
+                            else:
+                                username = full_u
+                        else:
+                            username = full_u
                     else:
                         user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_@.-]+)', line, re.IGNORECASE)
                         if user_match:
@@ -1884,11 +1890,16 @@ def update_traffic_from_logs():
                         else:
                             ss_match = re.search(r'(?:^|[^a-zA-Z0-9_@.-])(ss_[a-zA-Z0-9_@.-]+)', line)
                             if ss_match:
-                                username = ss_match.group(1)
-                                if '@' in username:
-                                    parts = username.split('@')
+                                full_u = ss_match.group(1)
+                                if '@' in full_u:
+                                    parts = full_u.split('@')
                                     if len(parts) > 1 and (parts[-1][0].isdigit() or '.' in parts[-1]):
+                                        session_id = parts[-1]
                                         username = '@'.join(parts[:-1])
+                                    else:
+                                        username = full_u
+                                else:
+                                    username = full_u
                             else:
                                 continue
                     if not username or not username.startswith(USER_PREFIX):
@@ -1898,9 +1909,11 @@ def update_traffic_from_logs():
                     is_disconnect = ']:' in line or 'disconnect' in line.lower()
 
                     if is_connect:
-                        ONLINE_SESSIONS[username] = ONLINE_SESSIONS.get(username, 0) + 1
+                        if username not in ONLINE_SESSIONS: ONLINE_SESSIONS[username] = {}
+                        ONLINE_SESSIONS[username][session_id] = time.time()
                     elif is_disconnect:
-                        ONLINE_SESSIONS[username] = max(0, ONLINE_SESSIONS.get(username, 0) - 1)
+                        if username in ONLINE_SESSIONS and session_id in ONLINE_SESSIONS[username]:
+                            del ONLINE_SESSIONS[username][session_id]
 
                         # Only update DB if we haven't processed this line before
                         if current_line_pos >= saved_offset:
@@ -1943,13 +1956,19 @@ def update_traffic_from_logs():
                         c = conn.cursor()
                         for line in f:
                             username = None
+                            session_id = "default"
                             user_match = re.search(r'username%([a-zA-Z0-9_@.-]+)', line)
                             if user_match:
-                                username = user_match.group(1)
-                                if '@' in username:
-                                    parts = username.split('@')
+                                full_u = user_match.group(1)
+                                if '@' in full_u:
+                                    parts = full_u.split('@')
                                     if len(parts) > 1 and (parts[-1][0].isdigit() or '.' in parts[-1] or '[' in parts[-1]):
+                                        session_id = parts[-1]
                                         username = '@'.join(parts[:-1])
+                                    else:
+                                        username = full_u
+                                else:
+                                    username = full_u
                             else:
                                 user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_@.-]+)', line, re.IGNORECASE)
                                 if user_match:
@@ -1957,11 +1976,16 @@ def update_traffic_from_logs():
                                 else:
                                     ss_match = re.search(r'(?:^|[^a-zA-Z0-9_@.-])(ss_[a-zA-Z0-9_@.-]+)', line)
                                     if ss_match:
-                                        username = ss_match.group(1)
-                                        if '@' in username:
-                                            parts = username.split('@')
+                                        full_u = ss_match.group(1)
+                                        if '@' in full_u:
+                                            parts = full_u.split('@')
                                             if len(parts) > 1 and (parts[-1][0].isdigit() or '.' in parts[-1]):
+                                                session_id = parts[-1]
                                                 username = '@'.join(parts[:-1])
+                                            else:
+                                                username = full_u
+                                        else:
+                                            username = full_u
                                     else:
                                         continue
                             if not username or not username.startswith(USER_PREFIX): continue
@@ -1970,9 +1994,11 @@ def update_traffic_from_logs():
                             is_disconnect = ']:' in line or 'disconnect' in line.lower()
 
                             if is_connect:
-                                ONLINE_SESSIONS[username] = ONLINE_SESSIONS.get(username, 0) + 1
+                                if username not in ONLINE_SESSIONS: ONLINE_SESSIONS[username] = {}
+                                ONLINE_SESSIONS[username][session_id] = time.time()
                             elif is_disconnect:
-                                ONLINE_SESSIONS[username] = max(0, ONLINE_SESSIONS.get(username, 0) - 1)
+                                if username in ONLINE_SESSIONS and session_id in ONLINE_SESSIONS[username]:
+                                    del ONLINE_SESSIONS[username][session_id]
                                 up, down = 0, 0
                                 # Try new format: (\d+) -> user@... -> (\d+)
                                 traffic_match = re.search(r'(\d+)\s+->\s+username%'+re.escape(username)+r'@.*?\s+->\s+(\d+)', line)
@@ -1997,9 +2023,16 @@ def update_traffic_from_logs():
                 # Use Tehran time (UTC+3:30)
                 tehran_now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
                 LAST_LOG_PROCESS = tehran_now.strftime('%H:%M:%S')
+                # Prune old sessions (10 min timeout as safety)
+                now = time.time()
+                for u in list(ONLINE_SESSIONS.keys()):
+                    for sid in list(ONLINE_SESSIONS[u].keys()):
+                        if now - ONLINE_SESSIONS[u][sid] > 600:
+                            del ONLINE_SESSIONS[u][sid]
+                    if not ONLINE_SESSIONS[u]: del ONLINE_SESSIONS[u]
         except Exception as e:
             app.logger.error(f"Traffic thread error: {e}")
-        time.sleep(10)
+        time.sleep(3)
 
 def check_expirations():
     while True:
