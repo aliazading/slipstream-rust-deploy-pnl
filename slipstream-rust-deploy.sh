@@ -19,7 +19,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Global variables
-SCRIPT_URL="https://raw.githubusercontent.com/AliRezaBeigy/slipstream-rust-deploy/master/slipstream-rust-deploy.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/aliazading/slipstream-rust-deploy-pnl/master/slipstream-rust-deploy.sh"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/slipstream-rust"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -1605,8 +1605,19 @@ setup_dante() {
 
     # Ensure log file exists for Dante
     touch /var/log/danted.log
-    chmod 640 /var/log/danted.log
-    chown root:root /var/log/danted.log
+    chmod 660 /var/log/danted.log
+    chown nobody:nogroup /var/log/danted.log 2>/dev/null || chown nobody:nobody /var/log/danted.log
+
+    # Fix for Dante logging on systems with strict systemd sandbox (like Ubuntu)
+    if [[ -d /lib/systemd/system ]]; then
+        print_status "Applying Dante logging fix for systemd..."
+        mkdir -p /etc/systemd/system/danted.service.d
+        cat > /etc/systemd/system/danted.service.d/override.conf << EOF
+[Service]
+ReadWritePaths=/var/log/danted.log
+EOF
+        systemctl daemon-reload 2>/dev/null || true
+    fi
 
     # Configure Dante
     cat > /etc/danted.conf << EOF
@@ -1708,7 +1719,7 @@ VPN_GROUP = "slipstream-users"
 USER_PREFIX = "ss_"
 DB_PATH = os.path.join(os.path.dirname(__file__), 'panel.db')
 DANTE_LOG = "/var/log/danted.log"
-ONLINE_SESSIONS = {} # {username: count}
+ONLINE_SESSIONS = {} # {username: {session_id: timestamp}}
 LAST_LOG_PROCESS = "هرگز"
 
 def init_db():
@@ -1718,7 +1729,15 @@ def init_db():
                  (username TEXT PRIMARY KEY,
                   expiry_date TIMESTAMP,
                   bytes_sent INTEGER DEFAULT 0,
-                  bytes_received INTEGER DEFAULT 0)''')
+                  bytes_received INTEGER DEFAULT 0,
+                  traffic_limit INTEGER DEFAULT 107374182400)''')
+
+    # Migration for existing DB
+    c.execute("PRAGMA table_info(users)")
+    columns = [col[1] for col in c.fetchall()]
+    if 'traffic_limit' not in columns:
+        c.execute("ALTER TABLE users ADD COLUMN traffic_limit INTEGER DEFAULT 107374182400")
+
     c.execute('''CREATE TABLE IF NOT EXISTS settings
                  (key TEXT PRIMARY KEY, value TEXT)''')
     conn.commit()
@@ -1797,16 +1816,23 @@ def get_vpn_users():
 
             sent = db_info.get('bytes_sent', 0)
             received = db_info.get('bytes_received', 0)
+            traffic_limit = db_info.get('traffic_limit', 107374182400)
+            total_bytes = sent + received
+            over_limit = total_bytes >= traffic_limit if traffic_limit > 0 else False
 
             users.append({
                 'username': u,
                 'enabled': is_enabled,
                 'expiry': expiry_str,
                 'remaining': remaining,
-                'sent': format_bytes(sent), # Download (from server perspective)
-                'received': format_bytes(received), # Upload (to server perspective)
-                'total': format_bytes(sent + received),
-                'online': ONLINE_SESSIONS.get(u, 0) > 0
+                'sent': format_bytes(sent),
+                'received': format_bytes(received),
+                'total': format_bytes(total_bytes),
+                'total_raw': total_bytes,
+                'limit': format_bytes(traffic_limit),
+                'limit_raw': traffic_limit,
+                'over_limit': over_limit,
+                'online': len(ONLINE_SESSIONS.get(u, {})) > 0
             })
         except:
             continue
@@ -1843,31 +1869,65 @@ def update_traffic_from_logs():
                     if not line:
                         break
 
-                    user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_-]+)', line, re.IGNORECASE)
+                    username = None
+                    session_id = "default"
+                    user_match = re.search(r'username%([a-zA-Z0-9_@.-]+)', line)
                     if user_match:
-                        username = user_match.group(1)
-                    else:
-                        ss_match = re.search(r'(?:^|[^a-zA-Z0-9_-])(ss_[a-zA-Z0-9_-]+)', line)
-                        if ss_match:
-                            username = ss_match.group(1)
+                        full_u = user_match.group(1)
+                        if '@' in full_u:
+                            parts = full_u.split('@')
+                            if len(parts) > 1 and (parts[-1][0].isdigit() or '.' in parts[-1] or '[' in parts[-1]):
+                                session_id = parts[-1]
+                                username = '@'.join(parts[:-1])
+                            else:
+                                username = full_u
                         else:
-                            continue
-                    if not username.startswith(USER_PREFIX):
+                            username = full_u
+                    else:
+                        user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_@.-]+)', line, re.IGNORECASE)
+                        if user_match:
+                            username = user_match.group(1)
+                        else:
+                            ss_match = re.search(r'(?:^|[^a-zA-Z0-9_@.-])(ss_[a-zA-Z0-9_@.-]+)', line)
+                            if ss_match:
+                                full_u = ss_match.group(1)
+                                if '@' in full_u:
+                                    parts = full_u.split('@')
+                                    if len(parts) > 1 and (parts[-1][0].isdigit() or '.' in parts[-1]):
+                                        session_id = parts[-1]
+                                        username = '@'.join(parts[:-1])
+                                    else:
+                                        username = full_u
+                                else:
+                                    username = full_u
+                            else:
+                                continue
+                    if not username or not username.startswith(USER_PREFIX):
                         continue
 
-                    line_lower = line.lower()
-                    if 'connect' in line_lower and ('pass' in line_lower or 'accepted' in line_lower):
-                        ONLINE_SESSIONS[username] = ONLINE_SESSIONS.get(username, 0) + 1
-                    elif 'disconnect' in line_lower:
-                        ONLINE_SESSIONS[username] = max(0, ONLINE_SESSIONS.get(username, 0) - 1)
+                    is_connect = '[:' in line or ('connect' in line.lower() and ('pass' in line.lower() or 'accepted' in line.lower()) and ']:' not in line)
+                    is_disconnect = ']:' in line or 'disconnect' in line.lower()
+
+                    if is_connect:
+                        if username not in ONLINE_SESSIONS: ONLINE_SESSIONS[username] = {}
+                        ONLINE_SESSIONS[username][session_id] = time.time()
+                    elif is_disconnect:
+                        if username in ONLINE_SESSIONS and session_id in ONLINE_SESSIONS[username]:
+                            del ONLINE_SESSIONS[username][session_id]
 
                         # Only update DB if we haven't processed this line before
                         if current_line_pos >= saved_offset:
                             up, down = 0, 0
-                            traffic_parts = re.findall(r'(\d+)\s+bytes?\s+(\w+)', line_lower)
-                            for val, label in traffic_parts:
-                                if label in ['uploaded', 'in', 'received']: up = int(val)
-                                elif label in ['downloaded', 'out', 'sent']: down = int(val)
+                            # Try new format: (\d+) -> user@... -> (\d+)
+                            traffic_match = re.search(r'(\d+)\s+->\s+username%'+re.escape(username)+r'@.*?\s+->\s+(\d+)', line)
+                            if traffic_match:
+                                up = int(traffic_match.group(1))
+                                down = int(traffic_match.group(2))
+                            else:
+                                traffic_parts = re.findall(r'(\d+)\s+bytes?\s+(\w+)', line.lower())
+                                for val, label in traffic_parts:
+                                    if label in ['uploaded', 'in', 'received']: up = int(val)
+                                    elif label in ['downloaded', 'out', 'sent']: down = int(val)
 
                             if up > 0 or down > 0:
                                 c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
@@ -1887,6 +1947,7 @@ def update_traffic_from_logs():
                 current_size = os.path.getsize(DANTE_LOG)
                 if current_size < last_offset: # Log rotation detected
                     last_offset = 0
+                    ONLINE_SESSIONS = {} # Clear sessions on rotation
 
                 if current_size > last_offset:
                     with open(DANTE_LOG, 'r', errors='replace') as f:
@@ -1894,28 +1955,61 @@ def update_traffic_from_logs():
                         conn = sqlite3.connect(DB_PATH)
                         c = conn.cursor()
                         for line in f:
-                            user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_-]+)', line, re.IGNORECASE)
+                            username = None
+                            session_id = "default"
+                            user_match = re.search(r'username%([a-zA-Z0-9_@.-]+)', line)
                             if user_match:
-                                username = user_match.group(1)
-                            else:
-                                # Fallback: look for ss_ prefix directly
-                                ss_match = re.search(r'(?:^|[^a-zA-Z0-9_-])(ss_[a-zA-Z0-9_-]+)', line)
-                                if ss_match:
-                                    username = ss_match.group(1)
+                                full_u = user_match.group(1)
+                                if '@' in full_u:
+                                    parts = full_u.split('@')
+                                    if len(parts) > 1 and (parts[-1][0].isdigit() or '.' in parts[-1] or '[' in parts[-1]):
+                                        session_id = parts[-1]
+                                        username = '@'.join(parts[:-1])
+                                    else:
+                                        username = full_u
                                 else:
-                                    continue
-                            if not username.startswith(USER_PREFIX): continue
+                                    username = full_u
+                            else:
+                                user_match = re.search(r'user\s*[:\s\[(]*\s*([a-zA-Z0-9_@.-]+)', line, re.IGNORECASE)
+                                if user_match:
+                                    username = user_match.group(1)
+                                else:
+                                    ss_match = re.search(r'(?:^|[^a-zA-Z0-9_@.-])(ss_[a-zA-Z0-9_@.-]+)', line)
+                                    if ss_match:
+                                        full_u = ss_match.group(1)
+                                        if '@' in full_u:
+                                            parts = full_u.split('@')
+                                            if len(parts) > 1 and (parts[-1][0].isdigit() or '.' in parts[-1]):
+                                                session_id = parts[-1]
+                                                username = '@'.join(parts[:-1])
+                                            else:
+                                                username = full_u
+                                        else:
+                                            username = full_u
+                                    else:
+                                        continue
+                            if not username or not username.startswith(USER_PREFIX): continue
 
-                            line_lower = line.lower()
-                            if 'connect' in line_lower and ('pass' in line_lower or 'accepted' in line_lower):
-                                ONLINE_SESSIONS[username] = ONLINE_SESSIONS.get(username, 0) + 1
-                            elif 'disconnect' in line_lower:
-                                ONLINE_SESSIONS[username] = max(0, ONLINE_SESSIONS.get(username, 0) - 1)
+                            is_connect = '[:' in line or ('connect' in line.lower() and ('pass' in line.lower() or 'accepted' in line.lower()) and ']:' not in line)
+                            is_disconnect = ']:' in line or 'disconnect' in line.lower()
+
+                            if is_connect:
+                                if username not in ONLINE_SESSIONS: ONLINE_SESSIONS[username] = {}
+                                ONLINE_SESSIONS[username][session_id] = time.time()
+                            elif is_disconnect:
+                                if username in ONLINE_SESSIONS and session_id in ONLINE_SESSIONS[username]:
+                                    del ONLINE_SESSIONS[username][session_id]
                                 up, down = 0, 0
-                                traffic_parts = re.findall(r'(\d+)\s+bytes?\s+(\w+)', line_lower)
-                                for val, label in traffic_parts:
-                                    if label in ['uploaded', 'in', 'received']: up = int(val)
-                                    elif label in ['downloaded', 'out', 'sent']: down = int(val)
+                                # Try new format: (\d+) -> user@... -> (\d+)
+                                traffic_match = re.search(r'(\d+)\s+->\s+username%'+re.escape(username)+r'@.*?\s+->\s+(\d+)', line)
+                                if traffic_match:
+                                    up = int(traffic_match.group(1))
+                                    down = int(traffic_match.group(2))
+                                else:
+                                    traffic_parts = re.findall(r'(\d+)\s+bytes?\s+(\w+)', line.lower())
+                                    for val, label in traffic_parts:
+                                        if label in ['uploaded', 'in', 'received']: up = int(val)
+                                        elif label in ['downloaded', 'out', 'sent']: down = int(val)
                                 if up > 0 or down > 0:
                                     c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
                                     c.execute("UPDATE users SET bytes_sent = bytes_sent + ?, bytes_received = bytes_received + ? WHERE username = ?", (down, up, username))
@@ -1929,23 +2023,34 @@ def update_traffic_from_logs():
                 # Use Tehran time (UTC+3:30)
                 tehran_now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
                 LAST_LOG_PROCESS = tehran_now.strftime('%H:%M:%S')
+                # Prune old sessions (10 min timeout as safety)
+                now = time.time()
+                for u in list(ONLINE_SESSIONS.keys()):
+                    for sid in list(ONLINE_SESSIONS[u].keys()):
+                        if now - ONLINE_SESSIONS[u][sid] > 600:
+                            del ONLINE_SESSIONS[u][sid]
+                    if not ONLINE_SESSIONS[u]: del ONLINE_SESSIONS[u]
         except Exception as e:
             app.logger.error(f"Traffic thread error: {e}")
-        time.sleep(10)
+        time.sleep(3)
 
 def check_expirations():
     while True:
         try:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
+            # 1. Check date expirations
             c.execute("SELECT username FROM users WHERE expiry_date < datetime('now')")
             expired_users = c.fetchall()
             for (username,) in expired_users:
-                status_res = subprocess.run(['passwd', '-S', username], capture_output=True, text=True)
-                if status_res.returncode == 0:
-                    status_info = status_res.stdout.split()
-                    if len(status_info) >= 2 and status_info[1] != 'L':
-                        subprocess.run(['usermod', '-L', username])
+                subprocess.run(['usermod', '-L', username], capture_output=True)
+
+            # 2. Check traffic limits
+            c.execute("SELECT username FROM users WHERE bytes_sent + bytes_received >= traffic_limit AND traffic_limit > 0")
+            overlimit_users = c.fetchall()
+            for (username,) in overlimit_users:
+                subprocess.run(['usermod', '-L', username], capture_output=True)
+
             conn.close()
         except Exception as e:
             pass
@@ -2004,13 +2109,14 @@ def add_user():
     username = request.form.get('username')
     password = request.form.get('password')
     days = request.form.get('days', '30')
+    limit_gb = request.form.get('limit_gb', '100')
 
     if not username or not password:
         flash('نام کاربری و رمز عبور الزامی است', 'warning')
         return redirect(url_for('dashboard'))
 
-    if not days.isdigit():
-        days = '30'
+    if not days.isdigit(): days = '30'
+    if not limit_gb.isdigit(): limit_gb = '100'
 
     if not username.startswith(USER_PREFIX):
         username = USER_PREFIX + username
@@ -2026,9 +2132,10 @@ def add_user():
         process.communicate(input=f'{username}:{password}')
 
         expiry_date = (datetime.utcnow() + timedelta(days=int(days))).strftime('%Y-%m-%d %H:%M:%S')
+        limit_bytes = int(limit_gb) * 1024 * 1024 * 1024
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO users (username, expiry_date) VALUES (?, ?)", (username, expiry_date))
+        c.execute("INSERT OR REPLACE INTO users (username, expiry_date, traffic_limit) VALUES (?, ?, ?)", (username, expiry_date, limit_bytes))
         conn.commit()
         conn.close()
 
@@ -2038,41 +2145,12 @@ def add_user():
 
     return redirect(url_for('dashboard'))
 
-@app.route(f'/{PANEL_PATH}/edit_user/<username>', methods=['POST'])
+@app.route(f'/{PANEL_PATH}/reset_online', methods=['POST'])
 @login_required
-def edit_user(username):
-    days = request.form.get('days')
-    if not days or not days.isdigit():
-        flash('تعداد روز معتبر نیست', 'warning')
-        return redirect(url_for('dashboard'))
-
-    expiry_date = (datetime.utcnow() + timedelta(days=int(days))).strftime('%Y-%m-%d %H:%M:%S')
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        # Use INSERT OR IGNORE then UPDATE to handle users missing from DB
-        c.execute("INSERT OR IGNORE INTO users (username, expiry_date) VALUES (?, ?)", (username, expiry_date))
-        c.execute("UPDATE users SET expiry_date = ? WHERE username = ?", (expiry_date, username))
-        conn.commit()
-        conn.close()
-        subprocess.run(['usermod', '-U', username])
-        flash(f'اعتبار کاربر {username} به {days} روز تغییر یافت', 'success')
-    except Exception as e:
-        flash(f'خطا: {str(e)}', 'danger')
-    return redirect(url_for('dashboard'))
-
-@app.route(f'/{PANEL_PATH}/reset_usage/<username>', methods=['POST'])
-@login_required
-def reset_usage(username):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("UPDATE users SET bytes_sent = 0, bytes_received = 0 WHERE username = ?", (username,))
-        conn.commit()
-        conn.close()
-        flash(f'حجم مصرفی کاربر {username} صفر شد', 'success')
-    except Exception as e:
-        flash(f'خطا: {str(e)}', 'danger')
+def reset_online():
+    global ONLINE_SESSIONS
+    ONLINE_SESSIONS = {}
+    flash('وضعیت آنلاین تمام کاربران ریست شد', 'info')
     return redirect(url_for('dashboard'))
 
 @app.route(f'/{PANEL_PATH}/toggle_user/<username>', methods=['POST'])
@@ -2099,6 +2177,56 @@ def toggle_user(username):
     except Exception as e:
         flash(f'خطا: {str(e)}', 'danger')
 
+    return redirect(url_for('dashboard'))
+
+@app.route(f'/{PANEL_PATH}/reset_usage/<username>', methods=['POST'])
+@login_required
+def reset_usage(username):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE users SET bytes_sent = 0, bytes_received = 0 WHERE username = ?", (username,))
+        conn.commit()
+        conn.close()
+        # Also unlock the user if they were locked due to traffic
+        subprocess.run(['usermod', '-U', username], capture_output=True)
+        flash(f'حجم مصرفی کاربر {username} صفر شد', 'success')
+    except Exception as e:
+        flash(f'خطا: {str(e)}', 'danger')
+    return redirect(url_for('dashboard'))
+
+@app.route(f'/{PANEL_PATH}/edit_user/<username>', methods=['POST'])
+@login_required
+def edit_user(username):
+    password = request.form.get('password')
+    limit_gb = request.form.get('limit_gb')
+    days = request.form.get('days')
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+
+        if password:
+            process = subprocess.Popen(['chpasswd'], stdin=subprocess.PIPE, text=True)
+            process.communicate(input=f'{username}:{password}')
+
+        if limit_gb and limit_gb.isdigit():
+            limit_bytes = int(limit_gb) * 1024 * 1024 * 1024
+            c.execute("UPDATE users SET traffic_limit = ? WHERE username = ?", (limit_bytes, username))
+
+        if days and days.isdigit():
+            new_expiry = (datetime.utcnow() + timedelta(days=int(days))).strftime('%Y-%m-%d %H:%M:%S')
+            c.execute("UPDATE users SET expiry_date = ? WHERE username = ?", (new_expiry, username))
+
+        conn.commit()
+        conn.close()
+
+        # Unlock user if they are being updated
+        subprocess.run(['usermod', '-U', username], capture_output=True)
+
+        flash(f'کاربر {username} با موفقیت بروزرسانی شد', 'success')
+    except Exception as e:
+        flash(f'خطا: {str(e)}', 'danger')
     return redirect(url_for('dashboard'))
 
 @app.route(f'/{PANEL_PATH}/delete_user/<username>', methods=['POST'])
@@ -2145,6 +2273,7 @@ EOF
         .form-control:focus { background-color: #333; color: #fff; border-color: #0d6efd; box-shadow: none; }
         .btn-primary { background-color: #0d6efd; border: none; }
         .form-label { color: #ffffff !important; }
+        .btn-xs { padding: 1px 5px; font-size: 0.75rem; border-radius: 3px; }
     </style>
 </head>
 <body>
@@ -2249,6 +2378,10 @@ EOF
                         <div class="col-md-3">
                             <div class="text-white small mb-1">کاربران آنلاین</div>
                             <div class="h4 mb-0 text-success" dir="ltr">{{ summary.active_count }} / {{ summary.user_count }}</div>
+                            <form action="{{ url_for('reset_online') }}" method="POST" class="mt-1">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button type="submit" class="btn btn-outline-warning btn-xs" style="font-size: 0.6rem;">ریست وضعیت آنلاین</button>
+                            </form>
                         </div>
                     </div>
                 </div>
@@ -2275,6 +2408,10 @@ EOF
                         <div class="mb-3">
                             <label for="days" class="form-label">تعداد روزهای اعتبار</label>
                             <input type="number" name="days" class="form-control" id="days" value="30" min="1" required>
+                        </div>
+                        <div class="mb-3">
+                            <label for="limit_gb" class="form-label">محدودیت حجم (GB)</label>
+                            <input type="number" name="limit_gb" class="form-control" id="limit_gb" value="100" min="1" required>
                         </div>
                         <button type="submit" class="btn btn-success w-100">افزودن</button>
                     </form>
@@ -2307,10 +2444,12 @@ EOF
                                         </div>
                                     </td>
                                     <td class="align-middle">
-                                        {% if user.enabled %}
+                                        {% if user.over_limit %}
+                                            <span class="badge bg-danger">پایان حجم</span>
+                                        {% elif user.enabled %}
                                             <span class="badge bg-success">فعال</span>
                                         {% else %}
-                                            <span class="badge bg-danger">غیرفعال</span>
+                                            <span class="badge bg-secondary">غیرفعال</span>
                                         {% endif %}
                                     </td>
                                     <td class="align-middle">
@@ -2327,13 +2466,13 @@ EOF
                                     </td>
                                     <td class="align-middle">
                                         <div class="usage-text mb-1">
-                                            <span class="text-white">↑ {{ user.received }}</span><br>
-                                            <span class="text-white">↓ {{ user.sent }}</span><br>
-                                            <strong class="text-info">Σ {{ user.total }}</strong>
+                                            <div class="d-flex justify-content-between small"><span class="text-muted">آپلود:</span><span class="text-white">{{ user.received }}</span></div>
+                                            <div class="d-flex justify-content-between small"><span class="text-muted">دانلود:</span><span class="text-white">{{ user.sent }}</span></div>
+                                            <div class="d-flex justify-content-between border-top mt-1 pt-1"><span class="text-muted small">کل/سقف:</span><strong class="text-info" style="font-size: 0.8rem;">{{ user.total }} / {{ user.limit }}</strong></div>
                                         </div>
                                         <form action="{{ url_for('reset_usage', username=user.username) }}" method="POST" onsubmit="return confirm('حجم مصرفی ریست شود؟');">
                                             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                            <button type="submit" class="btn btn-outline-secondary btn-sm" style="font-size: 0.7rem;">ریست حجم</button>
+                                            <button type="submit" class="btn btn-outline-secondary btn-xs py-0" style="font-size: 0.65rem;">ریست حجم</button>
                                         </form>
                                     </td>
                                     <td class="align-middle">
@@ -2346,10 +2485,43 @@ EOF
                                                     <button type="submit" class="btn btn-info btn-sm text-white w-100">فعال‌سازی</button>
                                                 {% endif %}
                                             </form>
+                                            <button type="button" class="btn btn-primary btn-sm w-100" data-bs-toggle="modal" data-bs-target="#editModal{{ loop.index }}">ویرایش</button>
                                             <form action="{{ url_for('delete_user', username=user.username) }}" method="POST" onsubmit="return confirm('آیا از حذف این کاربر اطمینان دارید؟');">
                                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                                 <button type="submit" class="btn btn-danger btn-sm w-100">حذف</button>
                                             </form>
+                                        </div>
+                                        <!-- Edit Modal -->
+                                        <div class="modal fade" id="editModal{{ loop.index }}" tabindex="-1" aria-hidden="true">
+                                          <div class="modal-dialog">
+                                            <div class="modal-content bg-dark text-white border-secondary text-end">
+                                              <div class="modal-header border-secondary">
+                                                <h5 class="modal-title">ویرایش کاربر {{ user.username }}</h5>
+                                                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                                              </div>
+                                              <form action="{{ url_for('edit_user', username=user.username) }}" method="POST">
+                                                <div class="modal-body">
+                                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                                    <div class="mb-3">
+                                                        <label class="form-label">رمز عبور جدید (خالی بگذارید اگر تغییر نمی‌کند)</label>
+                                                        <input type="password" name="password" class="form-control bg-dark text-white border-secondary">
+                                                    </div>
+                                                    <div class="mb-3">
+                                                        <label class="form-label">تمدید اعتبار (تعداد روز از الان)</label>
+                                                        <input type="number" name="days" class="form-control bg-dark text-white border-secondary" placeholder="مثلاً 30">
+                                                    </div>
+                                                    <div class="mb-3">
+                                                        <label class="form-label">محدودیت حجم جدید (GB)</label>
+                                                        <input type="number" name="limit_gb" class="form-control bg-dark text-white border-secondary" placeholder="{{ user.limit_raw // 1073741824 }}">
+                                                    </div>
+                                                </div>
+                                                <div class="modal-footer border-secondary">
+                                                  <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">انصراف</button>
+                                                  <button type="submit" class="btn btn-primary">ذخیره تغییرات</button>
+                                                </div>
+                                              </form>
+                                            </div>
+                                          </div>
                                         </div>
                                     </td>
                                 </tr>
