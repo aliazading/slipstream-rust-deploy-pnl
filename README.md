@@ -37,7 +37,7 @@ Go into your name registrar's configuration panel and add these records:
 
 **One-command installation:**
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/AliRezaBeigy/slipstream-rust-deploy/master/slipstream-rust-deploy.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/aliazading/slipstream-rust-deploy-pnl/master/slipstream-rust-deploy.sh)
 ```
 
 This command will:
@@ -133,17 +133,17 @@ Prebuilt client binaries are available for the following platforms:
 
 | Platform | Download |
 |----------|----------|
-| Linux (x86_64) | [slipstream-client-linux-amd64](https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/slipstream-client-linux-amd64) |
-| Linux (ARM64) | [slipstream-client-linux-arm64](https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/slipstream-client-linux-arm64) |
-| Windows (x86_64) | [slipstream-client-windows-amd64.exe](https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/slipstream-client-windows-amd64.exe) |
-| macOS (ARM64) | [slipstream-client-darwin-arm64](https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/slipstream-client-darwin-arm64) |
-| macOS (Intel) | [slipstream-client-darwin-amd64](https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/slipstream-client-darwin-amd64) |
+| Linux (x86_64) | [slipstream-client-linux-amd64](https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download/slipstream-client-linux-amd64) |
+| Linux (ARM64) | [slipstream-client-linux-arm64](https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download/slipstream-client-linux-arm64) |
+| Windows (x86_64) | [slipstream-client-windows-amd64.exe](https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download/slipstream-client-windows-amd64.exe) |
+| macOS (ARM64) | [slipstream-client-darwin-arm64](https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download/slipstream-client-darwin-arm64) |
+| macOS (Intel) | [slipstream-client-darwin-amd64](https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download/slipstream-client-darwin-amd64) |
 
 ### Quick Start (Linux/macOS)
 
 ```bash
 # Download the client for your platform
-curl -Lo slipstream-client https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/slipstream-client-linux-amd64
+curl -Lo slipstream-client https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download/slipstream-client-linux-amd64
 chmod +x slipstream-client
 
 # Run the client (connects to your server via DNS tunnel)
@@ -154,7 +154,7 @@ chmod +x slipstream-client
 
 ```powershell
 # Download the client
-Invoke-WebRequest -Uri "https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/slipstream-client-windows-amd64.exe" -OutFile "slipstream-client.exe"
+Invoke-WebRequest -Uri "https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download/slipstream-client-windows-amd64.exe" -OutFile "slipstream-client.exe"
 
 # Run the client
 .\slipstream-client.exe --resolver YOUR_SERVER_IP:53 --domain s.example.com
@@ -320,7 +320,7 @@ sudo journalctl -u slipstream-rust-server -f    # View logs
 
 **Uninstall**:
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/AliRezaBeigy/slipstream-rust-deploy/master/slipstream-rust-deploy.sh) uninstall           # Complete removal of slipstream-rust
+bash <(curl -Ls https://raw.githubusercontent.com/aliazading/slipstream-rust-deploy-pnl/master/slipstream-rust-deploy.sh) uninstall           # Complete removal of slipstream-rust
 ```
 
 **Dante SOCKS Service (SOCKS mode only)**:
@@ -344,9 +344,11 @@ slipstream-rust-deploy
 
 **Method 2: Re-run the curl command**
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/AliRezaBeigy/slipstream-rust-deploy/master/slipstream-rust-deploy.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/aliazading/slipstream-rust-deploy-pnl/master/slipstream-rust-deploy.sh)
 # The script will detect and install updates automatically
 ```
+
+**Note for Menu Options:** If you don't see the "Management Panel" options in the menu after updating, run the one-liner above again to force the script to overwrite with the latest version from the fork.
 
 ### Updating the Binary
 
@@ -486,6 +488,34 @@ sudo systemctl restart slipstream-rust-server
 - **Flexible tunneling**: SSH mode or SOCKS proxy mode
 - **Network ready**: Automatic firewall and iptables configuration
 - **TLS certificates**: Automatic generation and management of TLS certificates
+- **User Management Panel**: Simple web-based panel for managing VPN users (SOCKS mode)
+
+
+## User Management Panel (SOCKS Mode)
+
+When you install slipstream-rust in **SOCKS mode** with authentication enabled, the script automatically sets up a management panel.
+
+### Features
+- 🔒 **Secure Access**: Random port and secret URL path.
+- 👥 **User Management**: Add and delete VPN users easily.
+- 🌓 **Dark Mode**: Modern UI with Persian language support.
+- ⚡ **Real-time**: Changes take effect immediately.
+
+### Installation (Standalone)
+If you already have a Slipstream-Rust server running and just want to add the panel, run:
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/aliazading/slipstream-rust-deploy-pnl/master/install-panel.sh)
+```
+
+### How to Access
+After a successful installation, the script will display your unique Panel URL, Admin Username, and Admin Password.
+The URL will look something like this:
+`http://YOUR_SERVER_IP:PORT/SECRET_PATH/panel/login`
+
+### Management Commands
+- **Check Panel Status**: `systemctl status slipstream-panel`
+- **View Panel Logs**: `journalctl -u slipstream-panel -f`
+- **Restart Panel**: `systemctl restart slipstream-panel`
 
 
 ## Differences from C Implementation

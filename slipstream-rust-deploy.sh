@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# slipstream-rust Server Setup Script
+# slipstream-rust Server Setup Script (v1.1 - with Panel)
 # Supports Fedora, Rocky, CentOS, Debian, Ubuntu
 
 set -e
@@ -19,7 +19,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Global variables
-SCRIPT_URL="https://raw.githubusercontent.com/AliRezaBeigy/slipstream-rust-deploy/master/slipstream-rust-deploy.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/aliazading/slipstream-rust-deploy-pnl/master/slipstream-rust-deploy.sh"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/slipstream-rust"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -28,8 +28,11 @@ CONFIG_FILE="${CONFIG_DIR}/slipstream-rust-server.conf"
 SCRIPT_INSTALL_PATH="/usr/local/bin/slipstream-rust-deploy"
 BUILD_DIR="/opt/slipstream-rust"
 REPO_URL="https://github.com/Mygod/slipstream-rust.git"
+DEPLOY_REPO_URL="https://github.com/aliazading/slipstream-rust-deploy-pnl.git"
 SLIPSTREAM_PORT="5300"
-RELEASE_URL="https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download"
+PANEL_DIR="/usr/local/share/slipstream-rust-panel"
+VPN_GROUP="slipstream-users"
+RELEASE_URL="https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download"
 
 # Global variable to track if update is available
 UPDATE_AVAILABLE=false
@@ -177,6 +180,25 @@ uninstall_slipstream() {
         systemctl daemon-reload
     fi
 
+    # Stop and disable management panel if running
+    if systemctl is-active --quiet slipstream-panel 2>/dev/null; then
+        print_status "Stopping slipstream-panel service..."
+        systemctl stop slipstream-panel
+    fi
+    if systemctl is-enabled --quiet slipstream-panel 2>/dev/null; then
+        print_status "Disabling slipstream-panel service..."
+        systemctl disable slipstream-panel
+    fi
+    if [ -f "${SYSTEMD_DIR}/slipstream-panel.service" ]; then
+        print_status "Removing slipstream-panel service file..."
+        rm -f "${SYSTEMD_DIR}/slipstream-panel.service"
+        systemctl daemon-reload
+    fi
+    if [ -d "$PANEL_DIR" ]; then
+        print_status "Removing management panel directory..."
+        rm -rf "$PANEL_DIR"
+    fi
+
     # Stop and disable Dante if running
     if systemctl is-active --quiet danted 2>/dev/null; then
         print_status "Stopping Dante SOCKS service..."
@@ -295,10 +317,12 @@ show_menu() {
     echo "3) Check service status"
     echo "4) View service logs"
     echo "5) Show configuration info"
-    echo "6) Uninstall slipstream-rust"
+    echo "6) Show management panel info"
+    echo "7) Install/Update management panel only"
+    echo "8) Uninstall slipstream-rust"
     echo "0) Exit"
     echo ""
-    print_question "Please select an option (0-6): "
+    print_question "Please select an option (0-8): "
 }
 
 # Function to handle menu selection
@@ -332,6 +356,13 @@ handle_menu() {
                 show_configuration_info
                 ;;
             6)
+                show_panel_info
+                ;;
+            7)
+                setup_panel
+                show_panel_info
+                ;;
+            8)
                 if uninstall_slipstream; then
                     exit 0
                 fi
@@ -341,7 +372,7 @@ handle_menu() {
                 exit 0
                 ;;
             *)
-                print_error "Invalid choice. Please enter 0-6."
+                print_error "Invalid choice. Please enter 0-8."
                 ;;
         esac
 
@@ -400,6 +431,8 @@ EOF
 SOCKS_AUTH_ENABLED="${SOCKS_AUTH_ENABLED:-no}"
 SOCKS_USERNAME="${SOCKS_USERNAME:-}"
 SOCKS_PASSWORD="${SOCKS_PASSWORD:-}"
+PANEL_PORT="${PANEL_PORT:-}"
+PANEL_SECRET="${PANEL_SECRET:-}"
 EOF
     fi
 
@@ -414,6 +447,44 @@ EOF
     chmod 640 "$CONFIG_FILE"
     chown root:"$SLIPSTREAM_USER" "$CONFIG_FILE"
     print_status "Configuration saved to $CONFIG_FILE"
+}
+
+# Function to show management panel information
+show_panel_info() {
+    print_status "Management Panel Information"
+    print_status "============================"
+
+    # Check if configuration file exists
+    if [ ! -f "$CONFIG_FILE" ]; then
+        print_warning "No configuration found. Please install/configure slipstream-rust server first."
+        return 1
+    fi
+
+    # Load existing configuration
+    if ! load_existing_config; then
+        print_error "Failed to load configuration from $CONFIG_FILE"
+        return 1
+    fi
+
+    if [[ -z "${PANEL_PORT:-}" ]]; then
+        print_warning "Management panel is not configured or not available for the current mode."
+        return 0
+    fi
+
+    local public_ip
+    public_ip=$(curl -s https://ipinfo.io/ip || echo "YOUR_SERVER_IP")
+
+    echo ""
+    echo -e "${BLUE}Panel Details:${NC}"
+    echo -e "  URL:        ${YELLOW}http://${public_ip}:${PANEL_PORT}/${PANEL_SECRET}/panel/login${NC}"
+    echo -e "  Admin User: ${YELLOW}${SOCKS_USERNAME}${NC}"
+    echo -e "  Admin Pass: ${YELLOW}${SOCKS_PASSWORD}${NC}"
+    echo ""
+    echo -e "${BLUE}Panel Management:${NC}"
+    echo -e "  Status:  ${YELLOW}systemctl status slipstream-panel${NC}"
+    echo -e "  Restart: ${YELLOW}systemctl restart slipstream-panel${NC}"
+    echo -e "  Logs:    ${YELLOW}journalctl -u slipstream-panel -f${NC}"
+    echo ""
 }
 
 # Function to show configuration information
@@ -472,6 +543,16 @@ show_configuration_info() {
         echo -e "  Stop:    ${YELLOW}systemctl stop danted${NC}"
         echo -e "  Start:   ${YELLOW}systemctl start danted${NC}"
         echo -e "  Logs:    ${YELLOW}journalctl -u danted -f${NC}"
+
+        if [[ -n "${PANEL_PORT:-}" ]]; then
+            local public_ip
+            public_ip=$(curl -s https://ipinfo.io/ip || echo "YOUR_SERVER_IP")
+            echo ""
+            echo -e "${BLUE}Management Panel Information:${NC}"
+            echo -e "  URL:        ${YELLOW}http://${public_ip}:${PANEL_PORT}/${PANEL_SECRET}/panel/login${NC}"
+            echo -e "  Admin User: ${YELLOW}${SOCKS_USERNAME}${NC}"
+            echo -e "  Admin Pass: ${YELLOW}${SOCKS_PASSWORD}${NC}"
+        fi
     fi
 
     # Show Shadowsocks info if applicable
@@ -1035,19 +1116,19 @@ download_prebuilt_binary() {
 
     print_status "Fetching latest release information..."
     local api_response
-    api_response=$(curl -fsSL "https://api.github.com/repos/AliRezaBeigy/slipstream-rust-deploy/releases/latest" 2>/dev/null)
+    api_response=$(curl -fsSL "https://api.github.com/repos/aliazading/slipstream-rust-deploy-pnl/releases/latest" 2>/dev/null)
     
     if [ -n "$api_response" ]; then
         latest_tag=$(echo "$api_response" | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4)
         if [ -n "$latest_tag" ]; then
             print_status "Found latest release tag: $latest_tag"
-            download_url="https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/download/${latest_tag}/${binary_name}"
+            download_url="https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/download/${latest_tag}/${binary_name}"
         fi
     fi
 
     if [ -z "$download_url" ]; then
-        print_warning "Could not fetch release tag from API, trying /latest/download endpoint..."
-        download_url="${RELEASE_URL}/${binary_name}"
+        print_warning "Could not fetch release tag from API, trying main repo as fallback for binaries..."
+        download_url="https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/latest/download/${binary_name}"
     fi
     print_status "Downloading prebuilt slipstream-server binary from: $download_url"
 
@@ -1482,6 +1563,9 @@ configure_firewall() {
         print_status "Configuring active firewalld..."
         firewall-cmd --permanent --add-port="$SLIPSTREAM_PORT"/udp
         firewall-cmd --permanent --add-port=53/udp
+        if [[ -n "${PANEL_PORT:-}" ]]; then
+            firewall-cmd --permanent --add-port="$PANEL_PORT"/tcp
+        fi
         firewall-cmd --reload
         print_status "Firewalld configured successfully"
 
@@ -1490,6 +1574,9 @@ configure_firewall() {
         print_status "Configuring active ufw..."
         ufw allow "$SLIPSTREAM_PORT"/udp
         ufw allow 53/udp
+        if [[ -n "${PANEL_PORT:-}" ]]; then
+            ufw allow "$PANEL_PORT"/tcp
+        fi
         print_status "UFW configured successfully"
 
     else
@@ -1549,15 +1636,22 @@ setup_dante() {
     if [[ "${SOCKS_AUTH_ENABLED:-no}" == "yes" && -n "${SOCKS_USERNAME:-}" && -n "${SOCKS_PASSWORD:-}" ]]; then
         socks_method="username"
         
+        # Create VPN group
+        if ! getent group "$VPN_GROUP" >/dev/null; then
+            groupadd "$VPN_GROUP"
+        fi
+
         if ! id "$SOCKS_USERNAME" &>/dev/null; then
             print_status "Creating system user for SOCKS authentication: $SOCKS_USERNAME"
-            useradd -r -s /bin/false -M "$SOCKS_USERNAME" 2>/dev/null || {
+            useradd -r -s /bin/false -M -G "$VPN_GROUP" "$SOCKS_USERNAME" 2>/dev/null || {
                 print_error "Failed to create system user: $SOCKS_USERNAME"
                 return 1
             }
             print_status "System user created: $SOCKS_USERNAME"
         else
             print_status "System user already exists: $SOCKS_USERNAME"
+            # Ensure user is in group
+            usermod -a -G "$VPN_GROUP" "$SOCKS_USERNAME"
         fi
         
         print_status "Setting password for SOCKS user: $SOCKS_USERNAME"
@@ -1786,6 +1880,109 @@ EOF
     print_status "Encryption method: $SHADOWSOCKS_METHOD"
 }
 
+# Function to setup management panel
+setup_panel() {
+    if [[ "$TUNNEL_MODE" != "socks" || "${SOCKS_AUTH_ENABLED:-no}" != "yes" ]]; then
+        return 0
+    fi
+
+    print_status "Setting up management panel..."
+
+    # Ensure git is installed
+    if ! command -v git &> /dev/null; then
+        print_status "Installing git..."
+        case $PKG_MANAGER in
+            dnf|yum) $PKG_MANAGER install -y git ;;
+            apt) apt install -y git ;;
+        esac
+    fi
+
+    # Install Python dependencies
+    case $PKG_MANAGER in
+        dnf|yum)
+            $PKG_MANAGER install -y python3 python3-pip
+            ;;
+        apt)
+            apt install -y python3 python3-pip python3-venv
+            ;;
+    esac
+
+    # Generate random port and secret if not already set
+    if [[ -z "${PANEL_PORT:-}" ]]; then
+        PANEL_PORT=$(shuf -i 10000-65000 -n 1)
+    fi
+    if [[ -z "${PANEL_SECRET:-}" ]]; then
+        PANEL_SECRET=$(openssl rand -hex 12)
+    fi
+
+    # Create panel directory
+    mkdir -p "$PANEL_DIR"
+
+    # Ensure panel files are available
+    if [[ ! -d "./panel" && ! -d "$BUILD_DIR/panel" ]]; then
+        print_status "Downloading panel files from repository: $DEPLOY_REPO_URL"
+        local temp_deploy_dir="/tmp/slipstream-deploy-repo"
+        rm -rf "$temp_deploy_dir"
+        if git clone --depth 1 "$DEPLOY_REPO_URL" "$temp_deploy_dir"; then
+            mkdir -p "$BUILD_DIR"
+            cp -r "$temp_deploy_dir/panel" "$BUILD_DIR/"
+            rm -rf "$temp_deploy_dir"
+            print_status "Successfully downloaded panel files."
+        else
+            print_error "Failed to download panel files from repository."
+            return 1
+        fi
+    else
+        print_status "Panel source files already present."
+    fi
+
+    local source_panel_dir="./panel"
+    if [[ ! -d "$source_panel_dir" ]]; then
+        source_panel_dir="$BUILD_DIR/panel"
+    fi
+
+    if [[ -d "$source_panel_dir" ]]; then
+        cp -r "$source_panel_dir"/* "$PANEL_DIR/"
+    else
+        print_error "Panel source directory not found!"
+        return 1
+    fi
+
+    # Create virtual environment and install requirements
+    if [ ! -d "$PANEL_DIR/venv" ]; then
+        python3 -m venv "$PANEL_DIR/venv"
+    fi
+    "$PANEL_DIR/venv/bin/pip" install -r "$PANEL_DIR/requirements.txt"
+
+    # Create systemd service for panel
+    cat > "${SYSTEMD_DIR}/slipstream-panel.service" << EOF
+[Unit]
+Description=slipstream-rust Management Panel
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$PANEL_DIR
+Environment="PANEL_PORT=$PANEL_PORT"
+Environment="PANEL_PATH=$PANEL_SECRET/panel"
+Environment="ADMIN_USER=$SOCKS_USERNAME"
+Environment="ADMIN_PASS=$SOCKS_PASSWORD"
+ExecStart=$PANEL_DIR/venv/bin/python $PANEL_DIR/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable slipstream-panel
+    systemctl restart slipstream-panel
+
+    print_status "Management panel started on port $PANEL_PORT"
+}
+
 # Function to create systemd service
 create_systemd_service() {
     print_status "Creating systemd service..."
@@ -1892,6 +2089,9 @@ print_success_box() {
     local header_color='\033[1;36m'  # Cyan for headers
     local reset='\033[0m'
 
+    local public_ip
+    public_ip=$(curl -s https://ipinfo.io/ip || echo "YOUR_SERVER_IP")
+
     echo ""
     # Top border
     echo -e "${border_color}+================================================================================${reset}"
@@ -1934,6 +2134,18 @@ print_success_box() {
         echo -e "  ${text_color}Stop:    systemctl stop danted${reset}"
         echo -e "  ${text_color}Start:   systemctl start danted${reset}"
         echo -e "  ${text_color}Logs:    journalctl -u danted -f${reset}"
+
+        if [[ -n "${PANEL_PORT:-}" ]]; then
+            echo ""
+            echo -e "${header_color}Management Panel Information:${reset}"
+            echo -e "  ${text_color}Panel URL: ${key_color}http://${public_ip}:${PANEL_PORT}/${PANEL_SECRET}/panel/login${reset}"
+            echo -e "  ${text_color}Admin User: ${key_color}${SOCKS_USERNAME}${reset}"
+            echo -e "  ${text_color}Admin Pass: ${key_color}${SOCKS_PASSWORD}${reset}"
+            echo ""
+            echo -e "${text_color}Panel commands:${reset}"
+            echo -e "  ${text_color}Status:  systemctl status slipstream-panel${reset}"
+            echo -e "  ${text_color}Logs:    journalctl -u slipstream-panel -f${reset}"
+        fi
     fi
 
     # Shadowsocks info if applicable
@@ -2071,7 +2283,10 @@ main() {
     # Generate certificates
     generate_certificates
 
-    # Save configuration after certificates are generated
+    # Setup management panel
+    setup_panel
+
+    # Save configuration after everything is set up
     save_config
 
     # Configure firewall and iptables
