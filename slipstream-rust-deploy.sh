@@ -19,7 +19,12 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Global variables
-SCRIPT_URL="https://raw.githubusercontent.com/aliazading/slipstream-rust-deploy-pnl/master/slipstream-rust-deploy.sh"
+GITHUB_USER="${GITHUB_USER:-aliazading}"
+GITHUB_REPO="${GITHUB_REPO:-slipstream-rust-deploy-pnl}"
+GITHUB_BRANCH="${GITHUB_BRANCH:-master}"
+BASE_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}"
+
+SCRIPT_URL="${SCRIPT_URL:-${BASE_URL}/slipstream-rust-deploy.sh}"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/slipstream-rust"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -28,11 +33,11 @@ CONFIG_FILE="${CONFIG_DIR}/slipstream-rust-server.conf"
 SCRIPT_INSTALL_PATH="/usr/local/bin/slipstream-rust-deploy"
 BUILD_DIR="/opt/slipstream-rust"
 REPO_URL="https://github.com/Mygod/slipstream-rust.git"
-DEPLOY_REPO_URL="https://github.com/aliazading/slipstream-rust-deploy-pnl.git"
+DEPLOY_REPO_URL="${DEPLOY_REPO_URL:-https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git}"
 SLIPSTREAM_PORT="5300"
 PANEL_DIR="/usr/local/share/slipstream-rust-panel"
 VPN_GROUP="slipstream-users"
-RELEASE_URL="https://github.com/aliazading/slipstream-rust-deploy-pnl/releases/latest/download"
+RELEASE_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}/releases/latest/download"
 
 # Global variable to track if update is available
 UPDATE_AVAILABLE=false
@@ -466,7 +471,7 @@ show_panel_info() {
         return 1
     fi
 
-    if [[ -z "${PANEL_PORT:-}" ]]; then
+    if [[ -z "${PANEL_PORT:-}" || ! -f "/etc/systemd/system/slipstream-panel.service" ]]; then
         print_warning "Management panel is not configured or not available for the current mode."
         return 0
     fi
@@ -544,7 +549,7 @@ show_configuration_info() {
         echo -e "  Start:   ${YELLOW}systemctl start danted${NC}"
         echo -e "  Logs:    ${YELLOW}journalctl -u danted -f${NC}"
 
-        if [[ -n "${PANEL_PORT:-}" ]]; then
+        if [[ -n "${PANEL_PORT:-}" && -f "/etc/systemd/system/slipstream-panel.service" ]]; then
             local public_ip
             public_ip=$(curl -s https://ipinfo.io/ip || echo "YOUR_SERVER_IP")
             echo ""
@@ -1665,9 +1670,8 @@ setup_dante() {
     # Configure Dante
     cat > /etc/danted.conf << EOF
 # Dante SOCKS server configuration
-logoutput: syslog
+logoutput: stderr
 user.privileged: root
-user.unprivileged: nobody
 
 # Internal interface (where clients connect)
 internal: 127.0.0.1 port = 1080
@@ -1688,7 +1692,7 @@ extension: bind
 # Client rules - allow connections from localhost
 client pass {
     from: 127.0.0.0/8 to: 0.0.0.0/0
-    log: error
+    log: connect disconnect error
 }
 
 # SOCKS rules - allow SOCKS requests to anywhere
@@ -1697,14 +1701,14 @@ socks pass {
     command: bind connect udpassociate
 EOF
 
-    if [[ -n "$passwd_file" ]]; then
+    if [[ "$socks_method" == "username" ]]; then
         cat >> /etc/danted.conf << EOF
     method: username
 EOF
     fi
 
     cat >> /etc/danted.conf << EOF
-    log: error
+    log: connect disconnect error
 }
 
 # Block IPv6 if not properly configured
@@ -1882,6 +1886,11 @@ EOF
 
 # Function to setup management panel
 setup_panel() {
+    # Check if panel is already configured (prevents duplicate info box if called multiple times)
+    if [[ -n "${PANEL_PORT:-}" && -f "/etc/systemd/system/slipstream-panel.service" ]]; then
+        return 0
+    fi
+
     if [[ "$TUNNEL_MODE" != "socks" || "${SOCKS_AUTH_ENABLED:-no}" != "yes" ]]; then
         return 0
     fi
@@ -1919,21 +1928,56 @@ setup_panel() {
     mkdir -p "$PANEL_DIR"
 
     # Ensure panel files are available
-    if [[ ! -d "./panel" && ! -d "$BUILD_DIR/panel" ]]; then
+    if [[ -d "./panel" ]]; then
+        print_status "Using panel files from current directory."
+        mkdir -p "$BUILD_DIR"
+        cp -r "./panel" "$BUILD_DIR/"
+    elif [[ -d "$BUILD_DIR/panel" ]]; then
+        print_status "Panel source files already present in build directory."
+    else
         print_status "Downloading panel files from repository: $DEPLOY_REPO_URL"
         local temp_deploy_dir="/tmp/slipstream-deploy-repo"
         rm -rf "$temp_deploy_dir"
-        if git clone --depth 1 "$DEPLOY_REPO_URL" "$temp_deploy_dir"; then
-            mkdir -p "$BUILD_DIR"
-            cp -r "$temp_deploy_dir/panel" "$BUILD_DIR/"
+
+        # Try to clone with specified branch, fallback to feature branch if needed
+        local clone_success=false
+        local branches_to_try=("$GITHUB_BRANCH" "master" "fix/panel-installation" "feature/user-management-panel-4891438396886854186")
+
+        for branch in "${branches_to_try[@]}"; do
+            print_status "Trying to download panel files from branch: $branch"
             rm -rf "$temp_deploy_dir"
-            print_status "Successfully downloaded panel files."
-        else
-            print_error "Failed to download panel files from repository."
-            return 1
+            if git clone --depth 1 -b "$branch" "$DEPLOY_REPO_URL" "$temp_deploy_dir" 2>/dev/null; then
+                if [[ -d "$temp_deploy_dir/panel" ]]; then
+                    mkdir -p "$BUILD_DIR"
+                    cp -r "$temp_deploy_dir/panel" "$BUILD_DIR/"
+                    rm -rf "$temp_deploy_dir"
+                    print_status "Successfully downloaded panel files from branch $branch."
+                    clone_success=true
+                    break
+                else
+                    print_warning "Panel directory not found in branch $branch."
+                fi
+            fi
+        done
+
+        if [[ "$clone_success" = false ]]; then
+            # Last ditch effort: default clone
+            print_status "Trying default branch clone..."
+            rm -rf "$temp_deploy_dir"
+            if git clone --depth 1 "$DEPLOY_REPO_URL" "$temp_deploy_dir" 2>/dev/null; then
+                if [[ -d "$temp_deploy_dir/panel" ]]; then
+                    mkdir -p "$BUILD_DIR"
+                    cp -r "$temp_deploy_dir/panel" "$BUILD_DIR/"
+                    rm -rf "$temp_deploy_dir"
+                    print_status "Successfully downloaded panel files from default branch."
+                    clone_success=true
+                fi
+            fi
         fi
-    else
-        print_status "Panel source files already present."
+
+        if [[ "$clone_success" = false ]]; then
+            print_error "Failed to download panel files from any known branch."
+        fi
     fi
 
     local source_panel_dir="./panel"
@@ -1944,15 +1988,16 @@ setup_panel() {
     if [[ -d "$source_panel_dir" ]]; then
         cp -r "$source_panel_dir"/* "$PANEL_DIR/"
     else
-        print_error "Panel source directory not found!"
-        return 1
+        print_error "Panel source directory not found! Skipping panel setup."
+        return 0
     fi
 
     # Create virtual environment and install requirements
+    print_status "Installing Python requirements for panel..."
     if [ ! -d "$PANEL_DIR/venv" ]; then
-        python3 -m venv "$PANEL_DIR/venv"
+        python3 -m venv "$PANEL_DIR/venv" || { print_error "Failed to create virtual environment"; return 0; }
     fi
-    "$PANEL_DIR/venv/bin/pip" install -r "$PANEL_DIR/requirements.txt"
+    "$PANEL_DIR/venv/bin/pip" install -r "$PANEL_DIR/requirements.txt" || { print_error "Failed to install requirements"; return 0; }
 
     # Create systemd service for panel
     cat > "${SYSTEMD_DIR}/slipstream-panel.service" << EOF
@@ -1978,7 +2023,7 @@ EOF
 
     systemctl daemon-reload
     systemctl enable slipstream-panel
-    systemctl restart slipstream-panel
+    systemctl restart slipstream-panel || { print_error "Failed to start panel service"; return 0; }
 
     print_status "Management panel started on port $PANEL_PORT"
 }
@@ -2135,7 +2180,7 @@ print_success_box() {
         echo -e "  ${text_color}Start:   systemctl start danted${reset}"
         echo -e "  ${text_color}Logs:    journalctl -u danted -f${reset}"
 
-        if [[ -n "${PANEL_PORT:-}" ]]; then
+        if [[ -n "${PANEL_PORT:-}" && -f "/etc/systemd/system/slipstream-panel.service" ]]; then
             echo ""
             echo -e "${header_color}Management Panel Information:${reset}"
             echo -e "  ${text_color}Panel URL: ${key_color}http://${public_ip}:${PANEL_PORT}/${PANEL_SECRET}/panel/login${reset}"

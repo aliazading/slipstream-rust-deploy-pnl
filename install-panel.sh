@@ -22,7 +22,12 @@ CONFIG_DIR="/etc/slipstream-rust"
 CONFIG_FILE="${CONFIG_DIR}/slipstream-rust-server.conf"
 PANEL_DIR="/usr/local/share/slipstream-rust-panel"
 SYSTEMD_DIR="/etc/systemd/system"
-DEPLOY_REPO_URL="https://github.com/aliazading/slipstream-rust-deploy-pnl.git"
+
+GITHUB_USER="${GITHUB_USER:-aliazading}"
+GITHUB_REPO="${GITHUB_REPO:-slipstream-rust-deploy-pnl}"
+GITHUB_BRANCH="${GITHUB_BRANCH:-master}"
+DEPLOY_REPO_URL="${DEPLOY_REPO_URL:-https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git}"
+
 VPN_GROUP="slipstream-users"
 
 print_status() { echo -e "${GREEN}[INFO]${NC} $1"; }
@@ -72,16 +77,53 @@ fi
 
 # 5. Download panel files
 print_status "Downloading panel files..."
-temp_dir="/tmp/slipstream-panel-install"
-rm -rf "$temp_dir"
-if ! git clone "$DEPLOY_REPO_URL" "$temp_dir"; then
-    print_error "Failed to clone repository from $DEPLOY_REPO_URL"
-    exit 1
-fi
+if [[ -d "./panel" ]]; then
+    print_status "Using panel files from current directory."
+    mkdir -p "$PANEL_DIR"
+    cp -r "./panel"/* "$PANEL_DIR/"
+else
+    temp_dir="/tmp/slipstream-panel-install"
+    rm -rf "$temp_dir"
 
-mkdir -p "$PANEL_DIR"
-cp -r "$temp_dir/panel"/* "$PANEL_DIR/"
-rm -rf "$temp_dir"
+    clone_success=false
+    branches_to_try=("$GITHUB_BRANCH" "master" "fix/panel-installation" "feature/user-management-panel-4891438396886854186")
+
+    for branch in "${branches_to_try[@]}"; do
+        print_status "Trying branch: $branch"
+        rm -rf "$temp_dir"
+        if git clone --depth 1 -b "$branch" "$DEPLOY_REPO_URL" "$temp_dir" 2>/dev/null; then
+            if [[ -d "$temp_dir/panel" ]]; then
+                mkdir -p "$PANEL_DIR"
+                cp -r "$temp_dir/panel"/* "$PANEL_DIR/"
+                rm -rf "$temp_dir"
+                print_status "Successfully downloaded panel files from branch $branch."
+                clone_success=true
+                break
+            else
+                print_warning "Panel directory not found in branch $branch."
+            fi
+        fi
+    done
+
+    if [[ "$clone_success" = false ]]; then
+        print_status "Trying default branch..."
+        rm -rf "$temp_dir"
+        if git clone --depth 1 "$DEPLOY_REPO_URL" "$temp_dir" 2>/dev/null; then
+            if [[ -d "$temp_dir/panel" ]]; then
+                mkdir -p "$PANEL_DIR"
+                cp -r "$temp_dir/panel"/* "$PANEL_DIR/"
+                rm -rf "$temp_dir"
+                print_status "Successfully downloaded panel files from default branch."
+                clone_success=true
+            fi
+        fi
+    fi
+
+    if [[ "$clone_success" = false ]]; then
+        print_error "Failed to download panel files from any known branch!"
+        exit 1
+    fi
+fi
 
 # 6. Setup Virtual Environment
 print_status "Setting up Python virtual environment..."

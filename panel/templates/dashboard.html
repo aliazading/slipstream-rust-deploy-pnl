@@ -7,34 +7,44 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.rtl.min.css">
     <style>
         body {
-            background-color: #121212;
-            color: #e0e0e0;
+            background-color: #0f0f0f;
+            color: #ffffff;
         }
         .navbar {
-            background-color: #1e1e1e;
+            background-color: #1a1a1a;
             border-bottom: 1px solid #333;
         }
         .card {
-            background-color: #1e1e1e;
-            border: 1px solid #333;
+            background-color: #1a1a1a;
+            border: 1px solid #444;
             margin-bottom: 20px;
         }
+        h5, .form-label {
+            color: #ffffff;
+            font-weight: bold;
+        }
         .table {
-            color: #e0e0e0;
+            color: #ffffff;
             background-color: transparent;
         }
         .table thead th {
-            border-bottom: 2px solid #333;
-            color: #fff;
-            background-color: #2c2c2c;
+            border-bottom: 2px solid #444;
+            color: #ffffff;
+            background-color: #333;
         }
         .table td {
-            border-bottom: 1px solid #222;
+            border-bottom: 1px solid #2a2a2a;
             background-color: transparent;
+            color: #ffffff;
         }
         .form-control {
-            background-color: #2c2c2c;
-            border-color: #444;
+            background-color: #262626;
+            border-color: #555;
+            color: #fff;
+        }
+        .input-group-text {
+            background-color: #444;
+            border-color: #555;
             color: #fff;
         }
         .form-control:focus {
@@ -42,9 +52,6 @@
             color: #fff;
             border-color: #0d6efd;
             box-shadow: none;
-        }
-        .btn-close-white {
-            filter: invert(1) grayscale(100%) brightness(200%);
         }
     </style>
 </head>
@@ -111,13 +118,27 @@
                             <tbody>
                                 {% for user in users %}
                                 <tr>
-                                    <td class="align-middle" dir="ltr">{{ user }}</td>
-                                    <td class="align-middle"><span class="badge bg-success">فعال</span></td>
+                                    <td class="align-middle" dir="ltr">{{ user.username }}</td>
+                                    <td class="align-middle">
+                                        {% if user.is_active %}
+                                            <span class="badge bg-success">فعال</span>
+                                        {% else %}
+                                            <span class="badge bg-danger">غیرفعال</span>
+                                        {% endif %}
+                                    </td>
                                     <td>
-                                        <form action="{{ url_for('delete_user', username=user) }}" method="POST" onsubmit="return confirm('آیا از حذف این کاربر اطمینان دارید؟');">
-                                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                            <button type="submit" class="btn btn-danger btn-sm">حذف</button>
-                                        </form>
+                                        <div class="d-flex gap-1">
+                                            <form action="{{ url_for('toggle_user', username=user.username) }}" method="POST">
+                                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                                <button type="submit" class="btn {{ 'btn-warning' if user.is_active else 'btn-primary' }} btn-sm">
+                                                    {{ 'غیرفعال' if user.is_active else 'فعال' }}
+                                                </button>
+                                            </form>
+                                            <form action="{{ url_for('delete_user', username=user.username) }}" method="POST" onsubmit="return confirm('آیا از حذف این کاربر اطمینان دارید؟');">
+                                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                                <button type="submit" class="btn btn-danger btn-sm">حذف</button>
+                                            </form>
+                                        </div>
                                     </td>
                                 </tr>
                                 {% else %}
